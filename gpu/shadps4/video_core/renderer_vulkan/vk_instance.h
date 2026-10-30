@@ -487,6 +487,14 @@ public:
                image_2d_view_of_3d_features.sampler2DViewOf3D;
     }
 
+    /// gow3: whether the VR eyes are drawn with a shading rate attachment (GOW3_VR_VRS=1).
+    bool IsFragmentShadingRateEnabled() const {
+        return fragment_shading_rate;
+    }
+    vk::Extent2D ShadingRateTexelSize() const {
+        return shading_rate_texel;
+    }
+
     /// Returns whether VK_EXT_image_view_min_lod is supported.
     bool IsImageViewMinLodSupported() const {
         return image_view_min_lod;
@@ -589,6 +597,8 @@ private:
     bool attachment_feedback_loop{};
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};
+    bool fragment_shading_rate{};
+    vk::Extent2D shading_rate_texel{8, 8};
     bool shader_clock{};
     bool pipeline_executable_properties{}; // gow3: GOW3_WAVE_STATS=1 (vk_wave_stats.h)
     bool amd_shader_info{};                // gow3: with it, VK_AMD_shader_info when present

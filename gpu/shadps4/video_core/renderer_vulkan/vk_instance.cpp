@@ -293,7 +293,8 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE,
         vk::PhysicalDevicePipelineBinaryFeaturesKHR,
         vk::PhysicalDeviceMaintenance5FeaturesKHR,
-        vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR>();
+        vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR,
+        vk::PhysicalDeviceFragmentShadingRateFeaturesKHR>();
     features = feature_chain.get().features;
 
     const vk::StructureChain properties_chain = physical_device.getProperties2<
@@ -444,6 +445,22 @@ bool Instance::CreateDevice() {
                  image_2d_view_of_3d_features.sampler2DViewOf3D);
     }
     image_view_min_lod = add_extension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+    // gow3: fixed foveated rendering of the VR eyes (vk_vr_shading_rate.h), GOW3_VR_VRS=1.
+    {
+        const char* env = std::getenv("GOW3_VR_VRS");
+        const auto& rate = feature_chain.get<vk::PhysicalDeviceFragmentShadingRateFeaturesKHR>();
+        if (env && env[0] == '1' && rate.attachmentFragmentShadingRate &&
+            rate.pipelineFragmentShadingRate &&
+            add_extension(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME)) {
+            const auto props = physical_device.getProperties2<
+                vk::PhysicalDeviceProperties2, vk::PhysicalDeviceFragmentShadingRatePropertiesKHR>();
+            const auto& rp = props.get<vk::PhysicalDeviceFragmentShadingRatePropertiesKHR>();
+            fragment_shading_rate = true;
+            shading_rate_texel = rp.minFragmentShadingRateAttachmentTexelSize;
+            std::printf("GPU: VR eyes with variable rate shading (attachment texels %ux%u)\n",
+                        shading_rate_texel.width, shading_rate_texel.height);
+        }
+    }
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     // gow3: FSR 4 v07 INT8 (vk_temporal_upscaler): quad derivatives in compute shaders.
     compute_shader_derivatives = add_extension(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
@@ -700,9 +717,16 @@ bool Instance::CreateDevice() {
         vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR{
             .pipelineExecutableInfo = pipeline_executable_features.pipelineExecutableInfo,
         },
+        vk::PhysicalDeviceFragmentShadingRateFeaturesKHR{
+            .pipelineFragmentShadingRate = true,
+            .attachmentFragmentShadingRate = true,
+        },
     };
     if (!pipeline_executable_properties) {
         device_chain.unlink<vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR>();
+    }
+    if (!fragment_shading_rate) {
+        device_chain.unlink<vk::PhysicalDeviceFragmentShadingRateFeaturesKHR>();
     }
 
     if (!custom_border_color) {

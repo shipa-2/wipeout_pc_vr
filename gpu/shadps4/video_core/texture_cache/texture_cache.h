@@ -439,6 +439,10 @@ private:
     void UntrackImage(ImageId image_id);
     void UntrackImageHead(ImageId image_id);
     void UntrackImageTail(ImageId image_id);
+    /// Unwatches the pages [begin, end) of a tracked image (a CPU write into them).
+    void UntrackImagePages(Image& image, VAddr begin, VAddr end);
+    /// Watches again the pages UntrackImagePages left unwatched.
+    void RestoreImagePages(Image& image);
 
     void MarkAsMaybeDirty(ImageId image_id, Image& image);
 

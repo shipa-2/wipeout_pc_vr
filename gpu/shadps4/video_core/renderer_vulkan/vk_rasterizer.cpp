@@ -1204,8 +1204,15 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     const u32 num_instances = regs.num_instances.NumInstances();
     const u32 first_vertex = vertex_offset;
     const u32 first_instance = instance_offset;
+    const bool vrs = instance.IsFragmentShadingRateEnabled();
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         const auto draw = [&] {
+            if (vrs) {
+                // gow3: per pixel, unless the pass's shading rate attachment says coarser.
+                constexpr std::array combiners{vk::FragmentShadingRateCombinerOpKHR::eKeep,
+                                               vk::FragmentShadingRateCombinerOpKHR::eReplace};
+                cmdbuf.setFragmentShadingRateKHR(vk::Extent2D{1, 1}, combiners);
+            }
             if (is_indexed) {
                 cmdbuf.drawIndexed(num_indices, num_instances, 0, s32(first_vertex),
                                    first_instance);
@@ -1342,12 +1349,19 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     const u64 args_offset = base;
     const vk::Buffer counts = count_address != 0 ? count_buffer->Handle() : vk::Buffer{};
     const u64 counts_offset = count_address != 0 ? count_offset : 0;
+    const bool vrs = instance.IsFragmentShadingRateEnabled();
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         for (const vk::Pipeline bound : {handle, square}) {
             if (!bound) {
                 break;
             }
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, bound);
+            if (vrs) {
+                // gow3: per pixel, unless the pass's shading rate attachment says coarser.
+                constexpr std::array combiners{vk::FragmentShadingRateCombinerOpKHR::eKeep,
+                                               vk::FragmentShadingRateCombinerOpKHR::eReplace};
+                cmdbuf.setFragmentShadingRateKHR(vk::Extent2D{1, 1}, combiners);
+            }
             if (is_indexed) {
                 if (counts) {
                     cmdbuf.drawIndexedIndirectCount(args, args_offset, counts, counts_offset, max_count,

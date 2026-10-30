@@ -178,6 +178,11 @@ GraphicsPipeline::GraphicsPipeline(
     if (instance.IsDynamicColorWriteMaskSupported()) {
         dynamic_states.push_back(vk::DynamicState::eColorWriteMaskEXT);
     }
+    if (instance.IsFragmentShadingRateEnabled()) {
+        // gow3: the VR eyes' rates come from an attachment (vk_vr_shading_rate.h): set at
+        // each bind to 1x1 combined with the attachment's (Rasterizer::DrawRecord).
+        dynamic_states.push_back(vk::DynamicState::eFragmentShadingRateKHR);
+    }
     if (instance.IsVertexInputDynamicState()) {
         dynamic_states.push_back(vk::DynamicState::eVertexInputEXT);
     } else if (!sdata.vertex_bindings.empty()) {
@@ -420,6 +425,9 @@ GraphicsPipeline::GraphicsPipeline(
 
     const vk::GraphicsPipelineCreateInfo pipeline_info = {
         .pNext = &pipeline_rendering_ci,
+        .flags = instance.IsFragmentShadingRateEnabled()
+                     ? vk::PipelineCreateFlagBits::eRenderingFragmentShadingRateAttachmentKHR
+                     : vk::PipelineCreateFlags{},
         .stageCount = static_cast<u32>(shader_stages.size()),
         .pStages = shader_stages.data(),
         .pVertexInputState = !instance.IsVertexInputDynamicState() ? &vertex_input_info : nullptr,

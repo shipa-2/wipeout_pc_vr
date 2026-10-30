@@ -18,6 +18,7 @@
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_warmup_inbox.h"
+#include "video_core/renderer_vulkan/vk_vr_shading_rate.h"
 #include "core/vr/openxr_host.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #ifdef MemoryBarrier
@@ -570,6 +571,12 @@ void Presenter::PresentHmdFrame(const Libraries::VideoOut::HmdFrame& hmd, u32 fr
     // statistics and GOW3_GPU_PROFILE count by it.
     rasterizer->NoteHeadsetFrame();
     if (!vr_exporter || !vr_exporter->HasLocalHost()) {
+        if (instance.IsFragmentShadingRateEnabled()) {
+            // The eyes' size for their shading rates also without a headset (tests).
+            VideoCore::TextureCache::ImageDesc desc{hmd.eye_textures[0], Shader::ImageResource{}};
+            const auto& info = texture_cache.GetImage(texture_cache.FindImage(desc)).info;
+            VrShadingRate::NoteEyeSize(info.size.width, info.size.height);
+        }
         return;
     }
     // The title hands the eyes over as textures it rendered as colour targets: the cache holds
@@ -582,6 +589,7 @@ void Presenter::PresentHmdFrame(const Libraries::VideoOut::HmdFrame& hmd, u32 fr
     }
     const auto& left = texture_cache.GetImage(ids[0]).info;
     const u32 eye_width = left.size.width, eye_height = left.size.height;
+    VrShadingRate::NoteEyeSize(eye_width, eye_height);
     Frame* const target = vr_exporter->AcquireLocal(eye_width * 2, eye_height);
     if (target == nullptr) {
         return; // the headset shows nothing now

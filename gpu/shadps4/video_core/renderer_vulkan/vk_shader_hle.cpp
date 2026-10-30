@@ -11,12 +11,21 @@
 #include "video_core/host_shaders/buffer_multi_copy_comp.h"
 #include "gow3_toggles.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
+#include "video_core/texture_cache/texture_cache.h"
+#include <boost/container/small_vector.hpp>
+#include <algorithm>
+#include <bit>
+#include <cmath>
+#include <limits>
+#include <optional>
 
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
 namespace Vulkan {
 
 static constexpr u64 COPY_SHADER_HASH = 0xfefebf9f;
+/// gow3: WipEout's render target fill (ExecuteFillShaderHLE).
+static constexpr u64 FILL_SHADER_HASH = 0x900ef98d;
 
 // gow3: the copy shader runs ~57 times per frame with ~1024 small ranges each. As one
 // vkCmdCopyBuffer with that many regions it cost ~37 ns of GPU time per range (~2.1 ms per
@@ -240,11 +249,195 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
     return true;
 }
 
+// gow3: WipEout's fill shader (FILL_SHADER_HASH): dst[i] = src[i & cb[1]] for
+// i < min(cb[0], user SGPR 6). WipEout clears its render targets this way, 8 MB a dispatch, a
+// layer in a run of consecutive dispatches. With the game's memory in place the zeros went over
+// PCIe and the image was uploaded again afterwards. A run of zeros over whole layers of the
+// images in that memory becomes a clear of those layers: done when the run reaches a layer's
+// first byte, the run's later dispatches inside it are skipped. Anything else (another pattern,
+// a run starting inside a layer, memory no image has) runs the shader itself. GOW3_FILL_CLEAR=0:
+// always the shader; GOW3_FILL_TRACE=1: what each fill does.
+/// The clear colour of a `format` texel whose every dword is `value` (the fill's pattern), for the
+/// formats whose texels are whole dwords; none for the others.
+static std::optional<vk::ClearColorValue> FillColor(vk::Format format, u32 value) {
+    if (value == 0) {
+        return vk::ClearColorValue{}; // zero bits are zero in every format
+    }
+    const auto half = [](u32 h) {
+        const u32 sign = (h >> 15) & 1, exp = (h >> 10) & 31, man = h & 1023;
+        float f = exp == 0 ? std::ldexp(float(man), -24)
+                  : exp == 31 ? (man ? std::numeric_limits<float>::quiet_NaN()
+                                     : std::numeric_limits<float>::infinity())
+                              : std::ldexp(float(man | 1024), int(exp) - 25);
+        return sign ? -f : f;
+    };
+    const auto byte = [value](u32 i) { return float((value >> (8 * i)) & 255) / 255.0f; };
+    vk::ClearColorValue color{};
+    switch (format) {
+    case vk::Format::eR16G16B16A16Sfloat:
+    case vk::Format::eR16G16Sfloat:
+        color.float32 = std::array{half(value & 0xffff), half(value >> 16), half(value & 0xffff),
+                                   half(value >> 16)};
+        return color;
+    case vk::Format::eR32Sfloat:
+    case vk::Format::eR32G32Sfloat:
+    case vk::Format::eR32G32B32A32Sfloat: {
+        const float f = std::bit_cast<float>(value);
+        color.float32 = std::array{f, f, f, f};
+        return color;
+    }
+    case vk::Format::eR32Uint:
+    case vk::Format::eR32G32Uint:
+    case vk::Format::eR32G32B32A32Uint:
+        color.uint32 = std::array{value, value, value, value};
+        return color;
+    case vk::Format::eR8G8B8A8Unorm:
+        color.float32 = std::array{byte(0), byte(1), byte(2), byte(3)};
+        return color;
+    case vk::Format::eB8G8R8A8Unorm:
+        color.float32 = std::array{byte(2), byte(1), byte(0), byte(3)};
+        return color;
+    case vk::Format::eR8G8B8A8Srgb:
+    case vk::Format::eB8G8R8A8Srgb: {
+        // A clear of an sRGB image takes linear values and encodes them: decoded here, so that
+        // the bytes come out as the fill's (alpha is linear).
+        const auto linear = [&](u32 i) {
+            const float c = byte(i);
+            return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+        };
+        const bool bgr = format == vk::Format::eB8G8R8A8Srgb;
+        color.float32 = std::array{linear(bgr ? 2 : 0), linear(1), linear(bgr ? 0 : 2), byte(3)};
+        return color;
+    }
+    default:
+        return std::nullopt; // packed and others: not decoded here
+    }
+}
+
+static bool ExecuteFillShaderHLE(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program,
+                                 Rasterizer& rasterizer) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("GOW3_FILL_CLEAR");
+        return !env || env[0] != '0';
+    }();
+    static const bool trace = std::getenv("GOW3_FILL_TRACE") != nullptr;
+    if (!enabled || info.buffers.size() < 3) {
+        return false;
+    }
+    const auto cb_sharp = info.buffers[0].GetSharp(info);
+    const auto src_sharp = info.buffers[1].GetSharp(info);
+    const auto dst_sharp = info.buffers[2].GetSharp(info);
+    const auto user_data = info.UserData();
+    if (!cb_sharp.base_address || !src_sharp.base_address || !dst_sharp.base_address ||
+        user_data.size() <= 6 || dst_sharp.GetStride() != 4 || src_sharp.GetStride() != 4) {
+        return false;
+    }
+    const auto* cb = reinterpret_cast<const u32*>(cb_sharp.base_address);
+    const u32 mask = cb[1];
+    const u64 threads = u64(cs_program.dim_x) * cs_program.num_thread_x.full;
+    const u64 count = std::min<u64>({cb[0], user_data[6], threads});
+    if (mask >= 64 || count == 0) {
+        return false;
+    }
+    const auto* pattern = reinterpret_cast<const u32*>(src_sharp.base_address);
+    const u32 value = pattern[0];
+    bool uniform = true;
+    for (u32 i = 1; i <= mask; ++i) {
+        uniform &= pattern[i] == value;
+    }
+    const VAddr begin = dst_sharp.base_address, end = begin + count * 4;
+
+    // The run of consecutive fills, and the layers it has cleared.
+    struct Cleared {
+        VideoCore::ImageId id;
+        u32 layer;
+    };
+    static VAddr run_end = 0;
+    static std::vector<Cleared> cleared;
+    if (begin != run_end) {
+        cleared.clear();
+    }
+    struct Plan {
+        VideoCore::Image* image;
+        u32 layer;
+        VideoCore::ImageId id;
+        vk::ClearColorValue color;
+    };
+    boost::container::small_vector<Plan, 4> plan;
+    bool handled = uniform;
+    VAddr covered_lo = ~0ull, covered_hi = 0;
+    auto& texture_cache = rasterizer.GetTextureCache();
+    if (handled) {
+        texture_cache.ForEachImageInRegion(begin, end - begin, [&](VideoCore::ImageId id,
+                                                                    VideoCore::Image& image) {
+            const auto& image_info = image.info;
+            const u32 layers = image_info.resources.layers;
+            if (trace) {
+                std::printf("  image %#llx+%#x %ux%u fmt %d layers %u levels %u depth %d\n",
+                            (unsigned long long)image_info.guest_address, image_info.guest_size,
+                            image_info.size.width, image_info.size.height,
+                            int(image_info.pixel_format), layers, image_info.resources.levels,
+                            int(image_info.props.is_depth));
+            }
+            const auto color = FillColor(image_info.pixel_format, value);
+            if (image_info.props.is_depth || image_info.resources.levels != 1 || layers == 0 ||
+                image_info.guest_size % layers != 0 || !color) {
+                handled = false;
+                return;
+            }
+            const u64 layer_bytes = image_info.guest_size / layers;
+            for (u32 layer = 0; layer < layers; ++layer) {
+                const VAddr lo = image_info.guest_address + layer * layer_bytes;
+                const VAddr hi = lo + layer_bytes;
+                if (hi <= begin || lo >= end) {
+                    continue;
+                }
+                covered_lo = std::min(covered_lo, std::max(lo, begin));
+                covered_hi = std::max(covered_hi, std::min(hi, end));
+                const bool done = std::ranges::any_of(cleared, [&](const Cleared& c) {
+                    return c.id == id && c.layer == layer;
+                });
+                if (done) {
+                    continue;
+                }
+                if (lo < begin) {
+                    handled = false; // the run did not start at this layer's first byte
+                    return;
+                }
+                plan.push_back({&image, layer, id, *color});
+            }
+        });
+        // Every byte of the fill in a layer of an image.
+        handled = handled && covered_lo == begin && covered_hi == end;
+    }
+    if (trace) {
+        std::printf("Fill shader: %#llx+%#llx pattern %u dwords %s %#x, %zu layers to clear, %s\n",
+                    (unsigned long long)begin, (unsigned long long)(end - begin), mask + 1,
+                    uniform ? "uniform" : "mixed", value, plan.size(), handled ? "cleared" : "shader");
+    }
+    if (!handled) {
+        run_end = 0;
+        cleared.clear();
+        return false;
+    }
+    auto& runtime = rasterizer.GetRuntime();
+    for (const auto& step : plan) {
+        const VideoCore::SubresourceRange range{.base = {.level = 0, .layer = step.layer},
+                                                .extent = {.levels = 1, .layers = 1}};
+        runtime.ClearImage(step.image, range, vk::ClearValue{step.color});
+        cleared.push_back({step.id, step.layer});
+    }
+    run_end = end;
+    return true;
+}
+
 bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
                       const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer) {
     switch (info.pgm_hash) {
     case COPY_SHADER_HASH:
         return ExecuteCopyShaderHLE(info, cs_program, rasterizer);
+    case FILL_SHADER_HASH:
+        return ExecuteFillShaderHLE(info, cs_program, rasterizer);
     default:
         return false;
     }

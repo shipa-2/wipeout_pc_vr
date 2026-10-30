@@ -155,6 +155,10 @@ public:
     bool scene_proxy = false; ///< gow3: SceneTargets holds a reduced-size proxy of it
     VAddr track_addr = 0;
     VAddr track_addr_end = 0;
+    /// gow3: pages inside [track_addr, track_addr_end) a CPU write left unwatched (the image
+    /// is CpuDirty): watched again when the image is tracked after its refresh, instead of
+    /// unwatching and watching the whole image (TextureCache::UntrackImagePages).
+    boost::container::small_vector<std::pair<VAddr, VAddr>, 4> untracked_pages;
     VAddr guest_begin = 0; ///< info.guest_address
     VAddr guest_end = 0;   ///< info.guest_address + info.guest_size
     BackingImage* backing{};
@@ -193,6 +197,7 @@ public:
     boost::container::static_vector<u64, 16> mip_hashes{};
     u64 lru_id{};
     u64 hash{};
+    s64 last_refresh_ns{}; ///< gow3: when the image was last refreshed from memory (steady clock)
 
 private:
     static Common::IncrementalIdProvider<u64> global_image_uid;

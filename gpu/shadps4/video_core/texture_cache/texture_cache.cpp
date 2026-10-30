@@ -3,6 +3,9 @@
 
 #include <filesystem>
 #include <map>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 #include <xxhash.h>
 #include "video_core/amdgpu/liverpool.h"
 
@@ -658,7 +661,27 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             // Untrack the image, so that the range is unprotected and the guest can write freely.
             InvalidateAlias(image);
             image.flags |= ImageFlagBits::CpuDirty;
-            UntrackImage(image_id);
+            // gow3: a large image keeps the rest of its pages watched. WipEout streams
+            // textures into memory a 85 MB 8192x8192 texture spans: every load unwatched and,
+            // at the next use, watched again all of it (mprotect of 21k pages each way, 35 ms
+            // stalls in a race). GOW3_PARTIAL_UNTRACK=0: the whole image, as before.
+            static const bool partial = [] {
+                const char* env = std::getenv("GOW3_PARTIAL_UNTRACK");
+                return !env || env[0] != '0';
+            }();
+            // Only textures the GPU just reads: a target the GPU draws to is written back to
+            // the game's memory, which a CPU write there must win over (a display buffer kept
+            // watched this way broke the game's start).
+            const bool sampled_only = !(image.flags & ImageFlagBits::GpuModified) &&
+                                      !image.usage.render_target && !image.usage.depth_target &&
+                                      !image.usage.storage && !image.usage.vo_surface;
+            if (partial && sampled_only && image.info.guest_size >= (4u << 20) &&
+                image.IsTracked() && image.track_addr <= pages_start &&
+                pages_end <= image.track_addr_end) {
+                UntrackImagePages(image, pages_start, pages_end);
+            } else {
+                UntrackImage(image_id);
+            }
         } else if (pages_end < image_end) {
             // This page access may or may not modify the image.
             // We should not mark it as dirty now. If it really was modified
@@ -1434,6 +1457,23 @@ void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.guest_samples > 1) {
         return;
     }
+    // gow3: a large texture its memory keeps being written to (WipEout streams its tracks'
+    // 8192x8192 ones in after the race has started, piece by piece, by the CPU and by GPU
+    // copies: every piece dirtied the whole image), not a render target,
+    // is refreshed at most every GOW3_REFRESH_THROTTLE_MS (250); meanwhile it keeps its last
+    // contents. 12 GiB of uploads in 5 s otherwise, frames of 40-660 ms.
+    static const s64 throttle_ns = [] {
+        const char* env = std::getenv("GOW3_REFRESH_THROTTLE_MS");
+        return s64(env ? std::strtoll(env, nullptr, 10) : 250) * 1'000'000;
+    }();
+    const s64 now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+    if (throttle_ns > 0 && image.info.guest_size >= 16_MB && image.last_refresh_ns != 0 &&
+        False(image.flags & ImageFlagBits::GpuModified) && now_ns - image.last_refresh_ns < throttle_ns) {
+        return;
+    }
+    image.last_refresh_ns = now_ns;
     ResolveReadbacks(image.info.guest_address, image.info.guest_size, true,
                      ReadbackSource::ImageRefresh);
     Gow3Stats::Timer timer{Gow3Stats::t_refresh};
@@ -1598,11 +1638,76 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     });
 }
 
-void TextureCache::TrackImage(ImageId image_id) {
+namespace {
+/// GOW3_TRACK_TRACE=1 (diagnostics): page tracking of images of 16 MiB and more, with the caller
+/// (an address in libgow3gpu.so: addr2line -f -e out/gpu/libgow3gpu.so <offset>).
+void TraceTracking(const char* what, const VideoCore::Image& image, u64 size, const void* caller) {
+    static const bool trace = std::getenv("GOW3_TRACK_TRACE") != nullptr;
+    if (!trace || size < (16ull << 20)) {
+        return;
+    }
+#ifdef _WIN32
+    struct { void* dli_fbase; } info{nullptr};
+#else
+    Dl_info info{};
+    dladdr(caller, &info);
+#endif
+    std::printf("Track: %s %#llx+%#llx of image %ux%u fmt %d flags %#x from +%#llx\n", what,
+                (unsigned long long)image.info.guest_address, (unsigned long long)size,
+                image.info.size.width, image.info.size.height, int(image.info.pixel_format),
+                u32(image.flags),
+                (unsigned long long)(reinterpret_cast<uintptr_t>(caller) -
+                                     reinterpret_cast<uintptr_t>(info.dli_fbase)));
+}
+} // namespace
+
+void TextureCache::UntrackImagePages(Image& image, VAddr begin, VAddr end) {
+    for (const auto& [lo, hi] : image.untracked_pages) {
+        if (lo <= begin && end <= hi) {
+            return; // unwatched already
+        }
+    }
+    // Overlapping ranges: the part not unwatched yet, one range at a time (a write is a few
+    // pages; a range already unwatched is not unwatched twice).
+    for (auto& [lo, hi] : image.untracked_pages) {
+        if (begin < hi && lo < end) {
+            if (begin < lo) {
+                UntrackImagePages(image, begin, lo);
+            }
+            if (hi < end) {
+                UntrackImagePages(image, hi, end);
+            }
+            return;
+        }
+    }
+    if (image.untracked_pages.size() >= 64) {
+        // Many scattered writes: one range from the first to the last page.
+        for (const auto& [lo, hi] : image.untracked_pages) {
+            begin = std::min(begin, lo);
+            end = std::max(end, hi);
+        }
+        RestoreImagePages(image);
+        tracker.UpdatePageWatchers<false>(begin, end - begin);
+        image.untracked_pages.emplace_back(begin, end);
+        return;
+    }
+    image.untracked_pages.emplace_back(begin, end);
+    tracker.UpdatePageWatchers<false>(begin, end - begin);
+}
+
+void TextureCache::RestoreImagePages(Image& image) {
+    for (const auto& [lo, hi] : image.untracked_pages) {
+        tracker.UpdatePageWatchers<1>(lo, hi - lo);
+    }
+    image.untracked_pages.clear();
+}
+
+[[gnu::noinline]] void TextureCache::TrackImage(ImageId image_id) {
     auto& image = slot_images[image_id];
     if (!(image.flags & ImageFlagBits::Registered)) {
         return;
     }
+    RestoreImagePages(image);
     const auto image_begin = image.info.guest_address;
     const auto image_end = image.info.guest_address + image.info.guest_size;
     if (image_begin == image.track_addr && image_end == image.track_addr_end) {
@@ -1613,6 +1718,7 @@ void TextureCache::TrackImage(ImageId image_id) {
         // Re-track the whole image
         image.track_addr = image_begin;
         image.track_addr_end = image_end;
+        TraceTracking("track", image, image.info.guest_size, __builtin_return_address(0));
         tracker.UpdatePageWatchers<1>(image_begin, image.info.guest_size);
     } else {
         if (image_begin < image.track_addr) {
@@ -1629,6 +1735,7 @@ void TextureCache::TrackImageHead(ImageId image_id) {
     if (!(image.flags & ImageFlagBits::Registered)) {
         return;
     }
+    RestoreImagePages(image);
     const auto image_begin = image.info.guest_address;
     if (image_begin == image.track_addr) {
         return;
@@ -1644,6 +1751,7 @@ void TextureCache::TrackImageTail(ImageId image_id) {
     if (!(image.flags & ImageFlagBits::Registered)) {
         return;
     }
+    RestoreImagePages(image);
     const auto image_end = image.info.guest_address + image.info.guest_size;
     if (image_end == image.track_addr_end) {
         return;
@@ -1655,22 +1763,25 @@ void TextureCache::TrackImageTail(ImageId image_id) {
     tracker.UpdatePageWatchers<1>(addr, size);
 }
 
-void TextureCache::UntrackImage(ImageId image_id) {
+[[gnu::noinline]] void TextureCache::UntrackImage(ImageId image_id) {
     auto& image = slot_images[image_id];
     if (!image.IsTracked()) {
         return;
     }
+    RestoreImagePages(image); // the whole image is unwatched below, those pages with it
     const auto addr = image.track_addr;
     const auto size = image.track_addr_end - image.track_addr;
     image.track_addr = 0;
     image.track_addr_end = 0;
     if (size != 0) {
+        TraceTracking("untrack", image, size, __builtin_return_address(0));
         tracker.UpdatePageWatchers<false>(addr, size);
     }
 }
 
 void TextureCache::UntrackImageHead(ImageId image_id) {
     auto& image = slot_images[image_id];
+    RestoreImagePages(image);
     const auto image_begin = image.info.guest_address;
     if (!image.IsTracked() || image_begin < image.track_addr) {
         return;
@@ -1689,6 +1800,7 @@ void TextureCache::UntrackImageHead(ImageId image_id) {
 
 void TextureCache::UntrackImageTail(ImageId image_id) {
     auto& image = slot_images[image_id];
+    RestoreImagePages(image);
     const auto image_end = image.info.guest_address + image.info.guest_size;
     if (!image.IsTracked() || image.track_addr_end < image_end) {
         return;
@@ -1720,8 +1832,24 @@ void TextureCache::GarbageCollectImages() {
             const char* env = std::getenv("GOW3_GC_BUDGET_MB");
             return env ? std::strtoull(env, nullptr, 10) << 20 : 0;
         }();
-        if (instance.IsIntegrated() || forced_budget) {
-            const u64 budget = forced_budget ? forced_budget : instance.GetDeviceMemoryBudgetNow();
+        // gow3: discrete GPUs too. Their marks came from the budget at startup, already cut by
+        // other programs then (SteamVR: a 3.5 GiB pressure mark on 16 GiB in WipEout's VR mode).
+        // The race needs ~5 GiB: textures were evicted and uploaded again all the time, 0.2-5 GiB
+        // a frame, frames of 40-660 ms. GOW3_GC_LIVE_BUDGET=0: the startup marks on discrete GPUs.
+        static const bool live_budget = [] {
+            const char* env = std::getenv("GOW3_GC_LIVE_BUDGET");
+            return !env || env[0] != '0';
+        }();
+        if (instance.IsIntegrated() || forced_budget || live_budget) {
+            // The driver's budget is an ioctl: once a second (the collector runs per submission).
+            static u64 live = 0;
+            static std::chrono::steady_clock::time_point asked{};
+            const auto now = std::chrono::steady_clock::now();
+            if (!forced_budget && (live == 0 || now - asked >= std::chrono::seconds{1})) {
+                live = instance.GetDeviceMemoryBudgetNow();
+                asked = now;
+            }
+            const u64 budget = forced_budget ? forced_budget : live;
             if (budget != 0) {
                 trigger_gc_memory = budget / 10 * 7;
                 pressure_gc_memory = budget / 100 * 85;

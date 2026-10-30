@@ -21,6 +21,7 @@
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_vr_shading_rate.h"
 #include "gow3_threads.h"
 
 namespace Vulkan {
@@ -87,6 +88,14 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         return;
     }
     EndRendering();
+    // gow3: the VR eyes' shading rates (vk_vr_shading_rate.h), uploaded outside the pass.
+    // Passes without depth only: RADV keeps the rates in the depth buffer's HTILE, and in passes
+    // with depth the geometry off the per-pixel middle was lost (WipEout's VR menu became a disc).
+    const vk::ImageView rate_view =
+        new_state.depth_stencil_attachment.image_view
+            ? vk::ImageView{}
+            : VrShadingRate::AttachmentFor(instance, *this, new_state.width, new_state.height,
+                                           new_state.num_layers);
     is_rendering = true;
     render_state = new_state;
 
@@ -121,7 +130,13 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
                                          vk::ClearDepthStencilValue{.stencil = db.clear_value[1]}},
     };
 
+    const vk::RenderingFragmentShadingRateAttachmentInfoKHR rate_attachment = {
+        .imageView = rate_view,
+        .imageLayout = vk::ImageLayout::eFragmentShadingRateAttachmentOptimalKHR,
+        .shadingRateAttachmentTexelSize = instance.ShadingRateTexelSize(),
+    };
     const vk::RenderingInfo rendering_info = {
+        .pNext = rate_view ? &rate_attachment : nullptr,
         .renderArea =
             {
                 .offset = {0, 0},
@@ -142,9 +157,12 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         return;
     }
     // The attachment infos live on this stack frame: the recorded closure keeps copies.
-    Record([info = rendering_info, color_attachments, depth_attachment,
-            stencil_attachment](vk::CommandBuffer cmdbuf) mutable {
+    Record([info = rendering_info, color_attachments, depth_attachment, stencil_attachment,
+            rate_attachment](vk::CommandBuffer cmdbuf) mutable {
         info.pColorAttachments = color_attachments.data();
+        if (info.pNext) {
+            info.pNext = &rate_attachment;
+        }
         if (info.pDepthAttachment) {
             info.pDepthAttachment = &depth_attachment;
         }
