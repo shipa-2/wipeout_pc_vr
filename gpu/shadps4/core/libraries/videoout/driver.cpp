@@ -102,6 +102,14 @@ void VideoOutDriver::RunPresenter(std::function<void()> work, bool if_idle) {
     swap_cv.notify_one();
 }
 
+bool VideoOutDriver::PresenterIdle() {
+    if (!separate_swap) {
+        return true;
+    }
+    std::scoped_lock lock{swap_mutex};
+    return !swap_busy && swap_queue.empty();
+}
+
 void VideoOutDriver::SwapThread(std::stop_token token) {
     Common::SetCurrentThreadName("gow3:Present");
     while (true) {
@@ -669,9 +677,14 @@ void VideoOutDriver::SubmitHmdFrame(const HmdFrame& hmd_frame) {
         if (VideoOutPort* const port = hmd_port.load(std::memory_order_acquire)) {
             ReleaseHeldLabels(port);
         }
-        // The window shows the left eye (the title flips no display buffer of its own in VR).
-        Vulkan::Frame* const mirror = presenter->PrepareHmdMirrorFrame(frame);
-        RunPresenter([this, mirror] { presenter->Present(mirror); });
+        // The window shows the left eye (the title flips no display buffer of its own in VR),
+        // when it has shown the last one: with VSync on a monitor slower than the headset
+        // (75 Hz) its queue filled, and the GPU thread waited for a free frame: the game ran at
+        // the monitor's rate in the headset.
+        if (PresenterIdle()) {
+            Vulkan::Frame* const mirror = presenter->PrepareHmdMirrorFrame(frame);
+            RunPresenter([this, mirror] { presenter->Present(mirror); });
+        }
     });
 }
 

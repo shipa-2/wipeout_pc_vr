@@ -133,6 +133,8 @@ private:
     void DrawLastFrame();  // Used when there is no flip request
     void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
     void PresentThread(std::stop_token token);
+    /// gow3: the swap thread has nothing to do (a VR mirror frame would not wait for it).
+    bool PresenterIdle();
     /// gow3: runs presenter work (acquire, blit, vkQueuePresent) off the vblank thread, in
     /// order. Acquire and present block while the GPU is the bottleneck (much longer on NVIDIA);
     /// on the vblank thread that delayed the guest's vblank events and its frame timing jumped.
