@@ -66,6 +66,8 @@ pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
 if (NOT WIN32)
     pkg_check_modules(X11 REQUIRED IMPORTED_TARGET x11)
 endif()
+# PS VR in a headset of this machine (AstroQuest's OpenXR host): SteamVR or another OpenXR runtime.
+pkg_check_modules(OPENXR REQUIRED IMPORTED_TARGET openxr)
 find_package(miniz QUIET)
 if (NOT miniz_FOUND)
     set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -152,12 +154,20 @@ if (WIN32)
 else()
     set(GOW3GPU_KIND SHARED)
 endif()
+# PS VR libraries from AstroQuest (github.com/bigmak94/AstroQuest, its shadPS4 fork): the
+# headset, its tracking and camera, played in a headset of this machine through OpenXR
+# (core/vr). Without a headset the game sees none, as before.
+file(GLOB PSVR_SOURCES CONFIGURE_DEPENDS shadps4/core/libraries/hmd/*.cpp
+    shadps4/core/libraries/vr_tracker/*.cpp shadps4/core/libraries/camera/*.cpp
+    shadps4/core/vr/*.cpp)
 add_library(gow3gpu ${GOW3GPU_KIND} ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOURCES}
     shadps4/core/libraries/gnmdriver/gnmdriver.cpp
     shadps4/core/libraries/videoout/driver.cpp shadps4/core/libraries/videoout/video_out.cpp
     shadps4/core/libraries/kernel/equeue.cpp ${AVPLAYER}
-    shadps4/core/libraries/videodec/video_utils.cpp)
+    shadps4/core/libraries/videodec/video_utils.cpp ${PSVR_SOURCES})
 add_dependencies(gow3gpu host_shaders)
+target_compile_definitions(gow3gpu PRIVATE ENABLE_OPENXR_HOST)
+target_link_libraries(gow3gpu PRIVATE PkgConfig::OPENXR)
 # In-game settings menu: Dear ImGui (third_party/imgui, MIT) with its Vulkan backend, and an
 # embedded Cyrillic font (third_party/fonts).
 target_sources(gow3gpu PRIVATE third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp

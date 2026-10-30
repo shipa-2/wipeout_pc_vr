@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include <deque>
 #include <functional>
 
@@ -36,6 +38,9 @@ struct VideoOutPort {
     std::condition_variable vblank_cv;
     int flip_rate = 0;
     int prev_index = -1;
+    /// gow3: display buffers whose labels a headset flip left set (bit per index), released
+    /// once the GPU thread has read the frame's command buffers (VideoOutDriver::HmdFlip).
+    u32 held_labels = 0;
     bool is_open = false;
     bool is_hdr = false;
 
@@ -94,6 +99,21 @@ public:
                               const BufferAttribute* attribute);
 
     bool SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
+    /// gow3 (AstroQuest): a frame for the headset, composed on the GPU thread in order with
+    /// the draws that made its eyes, then handed to the OpenXR host.
+    void SubmitHmdFrame(const HmdFrame& frame);
+    /// The reprojection's flip: completed at once, without a picture for the window. While the GPU
+    /// thread has yet to read the last frame (`hold_labels`), the buffer labels it would release
+    /// stay set until it has (ReleaseHeldLabels).
+    void HmdFlip(VideoOutPort* port, s32 index, s64 flip_arg, bool hold_labels);
+    /// The labels HmdFlip held, once no headset frame is pending.
+    void ReleaseHeldLabels(VideoOutPort* port);
+    /// Whether the GPU thread has yet to take a headset frame submitted (with the title's
+    /// command buffers before it): the reprojection must not flip then.
+    bool HmdFramePending() const {
+        return hmd_taken.load(std::memory_order_acquire) <
+               hmd_submitted.load(std::memory_order_acquire);
+    }
 
 private:
     struct Request {
@@ -132,6 +152,9 @@ private:
     VideoOutPort main_port{};
     std::jthread present_thread;
     std::queue<Request> requests;
+    std::atomic<u64> hmd_submitted{0}; ///< SubmitHmdFrame calls
+    std::atomic<u64> hmd_taken{0};     ///< of them processed by the GPU thread
+    std::atomic<VideoOutPort*> hmd_port{}; ///< gow3: the port headset flips go to
 };
 
 } // namespace Libraries::VideoOut

@@ -23,6 +23,8 @@ public:
         return v ? std::strtol(v, nullptr, 10) : fallback;
     }
     s32 GetGpuId() { static const auto value = s32(Number("GOW3_GPU_ID", -1)); return value; }
+    // gow3: the host camera (SDL) the PS camera library opens, -1 none (AstroQuest's setting).
+    s32 GetCameraId() { static const auto value = s32(Number("GOW3_CAMERA_ID", -1)); return value; }
     u32 GetInternalScreenWidth() { static const auto value = u32(Number("GOW3_INTERNAL_WIDTH", 1920)); return value; }
     u32 GetInternalScreenHeight() { static const auto value = u32(Number("GOW3_INTERNAL_HEIGHT", 1080)); return value; }
     std::string GetPresentMode() { const char* v = std::getenv("GOW3_PRESENT_MODE"); return v ? v : "Mailbox"; }

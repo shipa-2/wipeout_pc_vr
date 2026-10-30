@@ -8,6 +8,7 @@
 /* Neighbours of runtime_kernel.c that the clocks never call. */
 int32_t *runtime_errno(void) { static int32_t value; return &value; }
 void runtime_report(void) {}
+void runtime_evf_flush_deferred(void) {}
 uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *name) {
     (void)table; (void)count; (void)name;
     return 0;

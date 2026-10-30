@@ -114,6 +114,7 @@ uint64_t runtime_process_time_counter(void) { return process_time_counter(); }
 uint64_t runtime_tsc_frequency(void) { return tsc_frequency(); }
 uint64_t runtime_read_tsc(void) { return read_tsc(); }
 static int sleep_ns(uint64_t ns) {
+    runtime_evf_flush_deferred();
 #ifdef _WIN32
     compat_sleep_ns(ns);
 #else

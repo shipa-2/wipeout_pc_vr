@@ -91,6 +91,7 @@ static ABI int32_t mutex_lock(GuestMutex **mutex) {
     if (e) return e;
     e = orbis_error(pthread_mutex_lock(&(*mutex)->native));
     if (!e) ++locks;
+    if (!e) runtime_evf_flush_deferred(); /* a flag set before this lock: now (runtime_extra.c) */
     return e;
 }
 static ABI int32_t mutex_trylock(GuestMutex **mutex) {
@@ -169,6 +170,7 @@ static ABI int32_t cond_wait(GuestCond **cond, GuestMutex **mutex) {
     if (e) return e;
     if (!mutex || (uintptr_t)*mutex < 3) return orbis_error(EINVAL);
     ++waits;
+    runtime_evf_flush_deferred();
     return orbis_error(pthread_cond_wait(&(*cond)->native, &(*mutex)->native));
 }
 static int32_t cond_wait_until(GuestCond **cond, GuestMutex **mutex, const struct timespec *end) {
@@ -176,6 +178,7 @@ static int32_t cond_wait_until(GuestCond **cond, GuestMutex **mutex, const struc
     if (e) return e;
     if (!mutex || (uintptr_t)*mutex < 3 || !end) return orbis_error(EINVAL);
     ++waits;
+    runtime_evf_flush_deferred();
     return timed_error(pthread_cond_timedwait(&(*cond)->native, &(*mutex)->native, end));
 }
 static ABI int32_t cond_timedwait(GuestCond **cond, GuestMutex **mutex, uint32_t usec) {

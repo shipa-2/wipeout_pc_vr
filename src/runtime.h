@@ -24,6 +24,8 @@ void runtime_report(void);
 void runtime_set_report_hook(void (*hook)(void));
 void runtime_finalize(void *dso);
 uintptr_t runtime_mutex_resolve(const char *name);
+/* Applies an event flag set this thread deferred (runtime_extra.c: WipEout's VR tracker flag). */
+void runtime_evf_flush_deferred(void);
 void runtime_mutex_report(void);
 uintptr_t runtime_memory_resolve(const char *name);
 void runtime_memory_report(void);

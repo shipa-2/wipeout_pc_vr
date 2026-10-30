@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <algorithm>
 #include <cmath>
+#include <thread>
 #include <vector>
 #include <chrono>
 #include <cstdio>
@@ -26,6 +28,7 @@
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/videoout/driver.h"
+#include "core/vr/vr_runtime.h"
 #include "core/libraries/videoout/videoout_error.h"
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -44,6 +47,8 @@ extern std::atomic<u64> g_gow3_capture_ns, g_gow3_async_ns, g_gow3_compile_wait_
 extern std::atomic<u64> g_gow3_snapshot_ns, g_gow3_guest_wait_ns;
 extern std::atomic<u32> g_gow3_pending_draws;
 } // namespace Vulkan
+
+namespace Libraries::Hmd { void OnVblank(); } // hmd_reprojection.cpp
 
 namespace Libraries::VideoOut {
 
@@ -301,16 +306,12 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
     return 0;
 }
 
-void VideoOutDriver::Flip(const Request& req) {
-    // Update HDR status before presenting, then present the frame (gow3: on the swap thread).
-    RunPresenter([this, frame = req.frame, hdr = req.port->is_hdr] {
-        presenter->SetHDR(hdr);
-        presenter->Present(frame);
-    });
-    Vulkan::FrameCapture::OnFlip(req.index >= 0 ? req.port->buffer_slots[req.index].address_left
-                                                : 0);
+namespace {
 
-    // gow3: GOW3_FRAME_STATS=1 prints flip rate and frame time spread every 5 seconds.
+/// gow3: GOW3_FRAME_STATS=1: the frame rate and frame time spread every 5 seconds, and what
+/// happened during long frames. Once a frame: a display flip, or a headset frame in VR (the
+/// title flips no display buffer of its own there).
+void FrameStats() {
     static const bool frame_stats = EmulatorSettingsImpl::Flag("GOW3_FRAME_STATS", false);
     if (frame_stats) {
         using Clock = std::chrono::steady_clock;
@@ -557,6 +558,21 @@ void VideoOutDriver::Flip(const Request& req) {
             std::fill(std::begin(last_wait) + 1, std::begin(last_wait) + 6, 0);
         }
     }
+}
+
+} // namespace
+
+void VideoOutDriver::Flip(const Request& req) {
+    // Update HDR status before presenting, then present the frame (gow3: on the swap thread).
+    RunPresenter([this, frame = req.frame, hdr = req.port->is_hdr] {
+        presenter->SetHDR(hdr);
+        presenter->Present(frame);
+    });
+    Vulkan::FrameCapture::OnFlip(req.index >= 0 ? req.port->buffer_slots[req.index].address_left
+                                                : 0);
+
+    // gow3: GOW3_FRAME_STATS=1 prints flip rate and frame time spread every 5 seconds.
+    FrameStats();
 
     // Update flip status.
     auto* port = req.port;
@@ -639,13 +655,96 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
     return true;
 }
 
+void VideoOutDriver::SubmitHmdFrame(const HmdFrame& hmd_frame) {
+    // Where the head was for it is worked out here and now: the seat the title's pose was
+    // counted from may be another by the time the GPU thread gets to the frame.
+    HmdFrame frame = hmd_frame;
+    frame.render_pose = Core::Vr::Runtime::Instance().ToHostSpace(hmd_frame.render_pose);
+    const u32 frame_id = Core::Vr::Runtime::Instance().NextFrameId();
+    hmd_submitted.fetch_add(1, std::memory_order_release);
+    liverpool->SendCommand([=, this]() {
+        FrameStats();
+        presenter->PresentHmdFrame(frame, frame_id);
+        hmd_taken.fetch_add(1, std::memory_order_release);
+        if (VideoOutPort* const port = hmd_port.load(std::memory_order_acquire)) {
+            ReleaseHeldLabels(port);
+        }
+        // The window shows the left eye (the title flips no display buffer of its own in VR).
+        Vulkan::Frame* const mirror = presenter->PrepareHmdMirrorFrame(frame);
+        RunPresenter([this, mirror] { presenter->Present(mirror); });
+    });
+}
+
+void VideoOutDriver::HmdFlip(VideoOutPort* port, s32 index, s64 flip_arg, bool hold_labels) {
+    hmd_port.store(port, std::memory_order_release);
+    {
+        std::unique_lock lock{port->port_mutex};
+        auto& flip_status = port->flip_status;
+        flip_status.count++;
+        flip_status.process_time = Libraries::Kernel::sceKernelGetProcessTime();
+        flip_status.tsc = Libraries::Kernel::sceKernelReadTsc();
+        flip_status.submit_tsc = flip_status.tsc;
+        flip_status.flip_arg = flip_arg;
+        flip_status.current_buffer = index;
+    }
+    for (auto event : port->flip_events) {
+        auto equeue = Kernel::GetEqueue(event);
+        if (equeue != nullptr) {
+            equeue->TriggerEvent(
+                static_cast<u64>(OrbisVideoOutInternalEventId::Flip),
+                Kernel::OrbisKernelEvent::Filter::VideoOut,
+                reinterpret_cast<void*>(static_cast<u64>(OrbisVideoOutInternalEventId::Flip) |
+                                        (flip_arg << 16)));
+        }
+    }
+    if (port->prev_index != -1) {
+        if (hold_labels) {
+            std::scoped_lock lock{port->port_mutex};
+            port->held_labels |= 1u << port->prev_index;
+        } else {
+            port->buffer_labels[port->prev_index] = 0;
+            port->SignalVoLabel();
+        }
+    }
+    port->prev_index = index;
+    if (!hold_labels) {
+        ReleaseHeldLabels(port); // held by an earlier refresh, the GPU thread took the frame since
+    }
+}
+
+void VideoOutDriver::ReleaseHeldLabels(VideoOutPort* port) {
+    u32 held;
+    {
+        std::scoped_lock lock{port->port_mutex};
+        if (port->held_labels == 0 || HmdFramePending()) {
+            return;
+        }
+        // Not the buffer on screen now: its label goes at the next flip.
+        held = port->held_labels & ~(port->prev_index >= 0 ? 1u << port->prev_index : 0u);
+        port->held_labels = 0;
+    }
+    for (u32 i = 0; held != 0; ++i, held >>= 1) {
+        if (held & 1) {
+            port->buffer_labels[i] = 0;
+        }
+    }
+    port->SignalVoLabel();
+}
+
 void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
     Vulkan::Frame* frame;
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);
+    } else if (port->buffer_slots[index].group_index < 0) {
+        // gow3: a flip the game submitted just before it unregistered the buffer (WipEout
+        // does when it switches to its VR mode). Non-EOP flips run on the GPU thread later than
+        // the game made them, after the unregistration: shown as a blank frame, the flip itself
+        // completes for the game. The assertion here ended about one start in VR out of three.
+        LOG_WARNING(Lib_VideoOut, "Flip of buffer {} after it was unregistered: a blank frame",
+                    index);
+        frame = presenter->PrepareBlankFrame(false);
     } else {
         const auto& buffer = port->buffer_slots[index];
-        ASSERT_MSG(buffer.group_index >= 0, "Trying to flip an unregistered buffer!");
         const auto& group = port->groups[buffer.group_index];
         frame = presenter->PrepareFrame(group, buffer.address_left);
     }
@@ -775,6 +874,56 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             vblank_status.process_time = Libraries::Kernel::sceKernelGetProcessTime();
             vblank_status.tsc = Libraries::Kernel::sceKernelReadTsc();
             main_port.vblank_cv.notify_all();
+        }
+
+        // gow3 (AstroQuest): the headset reprojects once per refresh of its panel (PS VR:
+        // 120 Hz; the host headset's rate when OpenXR reports one), whatever rate the port's
+        // vblank runs at (GOW3_VBLANK_HZ, up to 480). On deadlines of their own, each the previous
+        // one plus a period, taken at the vblank that reaches them: counting every fourth vblank
+        // of a timer that wakes a little late each time gave 116.7 refreshes a second instead of
+        // 120 (and the game 116.7 FPS). A thread of their own, exactly on time but off the
+        // vblanks, made it worse (87-116 FPS): the title paces on the vblank events too.
+        {
+            using Clock = std::chrono::steady_clock;
+            static Clock::time_point hmd_deadline{};
+            const auto now = Clock::now();
+            const float rate = std::clamp(Core::Vr::Runtime::Instance().HeadsetRefreshRate(), 60.0f,
+                                          144.0f);
+            const auto period = std::chrono::duration_cast<Clock::duration>(
+                std::chrono::duration<double>(1.0 / rate));
+            if (hmd_deadline == Clock::time_point{} || now - hmd_deadline > period * 4) {
+                hmd_deadline = now; // the first refresh, or far behind (a stall): start again
+            }
+            // gow3: phase-locked to the headset. A deadline counter of its own drifted against
+            // the runtime's refreshes: at times two of the title's frames came between two
+            // refreshes (one dropped, the next refresh showing the old one again: ~107 of 120
+            // shown, judder when the head turned), until the phases met again. The refreshes are
+            // taken at the runtime's wakes (xrWaitFrame) plus SHADPS4_VR_PHASE_MS (default 0),
+            // and the deadline is pulled a quarter of the way there each refresh.
+            static const auto phase = std::chrono::duration_cast<Clock::duration>(
+                std::chrono::duration<double, std::milli>([] {
+                    const char* env = std::getenv("SHADPS4_VR_PHASE_MS");
+                    return env ? std::strtod(env, nullptr) : 0.0;
+                }()));
+            static const bool lock_phase = [] {
+                const char* env = std::getenv("SHADPS4_VR_PHASE_LOCK");
+                return !env || env[0] != '0';
+            }();
+            const auto refresh = Core::Vr::Runtime::Instance().GetDisplayRefresh();
+            if (lock_phase && refresh.sequence != 0 && now - refresh.time < period * 8) {
+                // The target refresh nearest the deadline, on the runtime's grid.
+                const auto anchor = refresh.time + phase;
+                const double cycles = std::round(
+                    std::chrono::duration<double>(hmd_deadline - anchor).count() /
+                    std::chrono::duration<double>(period).count());
+                const auto target =
+                    anchor + std::chrono::duration_cast<Clock::duration>(period * cycles);
+                hmd_deadline += (target - hmd_deadline) / 4;
+            }
+            if (now >= hmd_deadline) {
+                hmd_deadline += period;
+                Libraries::Hmd::OnVblank();
+            }
         }
 
         if (!immediate_flips || main_port.flip_rate != 0) {

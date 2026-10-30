@@ -25,6 +25,8 @@
 #include <SDL3/SDL.h>
 #include "../gow3gpu.h"
 #include "common/elf_info.h"
+#include "core/vr/vr_runtime.h"
+#include "core/libraries/system/systemservice.h"
 #include "common/logging/log.h"
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/libs.h"
@@ -58,6 +60,9 @@ Frontend::WindowSDL* g_window = nullptr;
 namespace Libraries::GnmDriver { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
 namespace Libraries::AvPlayer { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
 namespace Libraries::VideoOut { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
+namespace Libraries::Hmd { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
+namespace Libraries::VrTracker { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
+namespace Libraries::Camera { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
 namespace Libraries::Kernel { void RegisterEventQueue(Core::Loader::SymbolsResolver* sym); }
 
 namespace {
@@ -251,6 +256,14 @@ extern "C" int gow3gpu_init(const Gow3GpuConfig* config) {
     if (config->user_dir) setenv("GOW3_GPU_USER_DIR", config->user_dir, 0);
 #endif
     Core::Emulator::FillElfInfo(*config);
+    // gow3 (AstroQuest): the emulated PS VR headset, and through OpenXR (SteamVR) a headset of
+    // this machine, for a title that supports one: before Vulkan, whose instance and device have
+    // to suit the OpenXR runtime.
+    {
+        const auto& psf = Common::ElfInfo::Instance().GetPSFAttributes();
+        Core::Vr::Runtime::Instance().Configure(psf.support_ps_vr.Value() != 0,
+                                                psf.require_ps_vr.Value() != 0);
+    }
     const std::string title = config->title ? config->title : "God of War III";
     const s32 width = config->width, height = config->height;
     g_window_thread = std::thread([title, width, height] {
@@ -279,8 +292,20 @@ extern "C" int gow3gpu_init(const Gow3GpuConfig* config) {
     // GnmDriver creates the presenter that the VideoOut present thread uses.
     Libraries::GnmDriver::RegisterLib(&resolver);
     Libraries::VideoOut::RegisterLib(&resolver);
+    // gow3: PS VR (AstroQuest's libraries): after FillElfInfo, which they read.
+    Libraries::Hmd::RegisterLib(&resolver);
+    Libraries::VrTracker::RegisterLib(&resolver);
+    Libraries::Camera::RegisterLib(&resolver);
     return 0;
 }
+
+// gow3: shadPS4's system service event queue is the C runtime's (sceSystemServiceReceiveEvent).
+extern "C" void runtime_push_system_event(const void* event, size_t size);
+namespace Libraries::SystemService {
+void PushSystemServiceEvent(const OrbisSystemServiceEvent& event) {
+    runtime_push_system_event(&event, sizeof(event));
+}
+} // namespace Libraries::SystemService
 
 namespace Libraries::Kernel { void StartKernelService(); }
 extern "C" void gow3gpu_register_kernel(void) {

@@ -47,6 +47,7 @@ constexpr auto Lib_FontFt = "Lib.FontFt";                           ///< The lib
 constexpr auto Lib_GameLiveStreaming = "Lib.GameLiveStreaming";     ///< The LibSceGameLiveStreaming implementation
 constexpr auto Lib_GnmDriver = "Lib.GnmDriver";                     ///< The LibSceGnmDriver implementation.
 constexpr auto Lib_Hmd = "Lib.Hmd";                                 ///< The LibSceHmd implementation.
+constexpr auto Core_Vr = "Core.Vr";                                 ///< gow3: the emulated headset and the OpenXR host (AstroQuest).
 constexpr auto Lib_HmdSetupDialog = "Lib.HmdSetupDialog";           ///< The LibSceHmdSetupDialog implementation.
 constexpr auto Lib_Http = "Lib.Http";                               ///< The LibSceHttp implementation.
 constexpr auto Lib_Http2 = "Lib.Http2";                             ///< The LibSceHttp2 implementation.

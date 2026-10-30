@@ -47,6 +47,8 @@ typedef struct EventFlag {
     int deleted;
     pthread_mutex_t lock;
     pthread_cond_t cond;
+    /* Set only once the setting thread holds a mutex or waits (runtime_evf_flush_deferred). */
+    int deferred;
     char name[32];
 } EventFlag;
 static size_t flags_created;
@@ -63,6 +65,16 @@ static ABI int32_t ef_create(EventFlag **out, const char *name, uint32_t attr, u
     f->magic=EF_MAGIC; f->attr=attr; f->bits=init;
     pthread_mutex_init(&f->lock,NULL); pthread_cond_init(&f->cond,NULL);
     if (name) snprintf(f->name,sizeof(f->name),"%s",name);
+    /* WipEout's VR tracker thread sets this flag and then locks a mutex and waits on a condition
+     * for the render thread's next command; the render thread, woken by the flag, writes the
+     * command under the mutex and signals after unlocking it. Woken at once, it could signal
+     * before the tracker waited: the signal was lost and both waited for good (the VR menu
+     * froze within minutes at light frames). On a PS4 the tracker's higher priority made it
+     * wait first. Deferred to its next mutex lock or condition wait, the render thread cannot
+     * take the mutex before the tracker waits. GOW3_EVF_DEFER=0: at once. */
+    static int defer=-1;
+    if (defer<0) { const char *e=getenv("GOW3_EVF_DEFER"); defer=!e || e[0]!='0'; }
+    f->deferred=defer && !strcmp(f->name,"VRTrackerCntrDoneEvent");
     *out=f; ++flags_created;
     return 0;
 }
@@ -76,9 +88,27 @@ static ABI int32_t ef_delete(EventFlag *handle) {
     /* Freed lazily: a waiter may still hold the lock; the leak is bounded by deletions. */
     return 0;
 }
+static _Thread_local EventFlag *deferred_flag;
+static _Thread_local uint64_t deferred_bits;
+static int32_t ef_set_now(EventFlag *f, uint64_t bits);
+void runtime_evf_flush_deferred(void) {
+    EventFlag *f=deferred_flag;
+    if (!f) return;
+    deferred_flag=NULL;
+    ef_set_now(f,deferred_bits);
+}
 static ABI int32_t ef_set(EventFlag *handle, uint64_t bits) {
     EventFlag *f=flag(handle);
     if (!f) return ERR(E_SRCH);
+    if (f->deferred) {
+        if (deferred_flag && deferred_flag!=f) runtime_evf_flush_deferred();
+        deferred_bits=deferred_flag==f ? deferred_bits|bits : bits;
+        deferred_flag=f;
+        return 0;
+    }
+    return ef_set_now(f,bits);
+}
+static int32_t ef_set_now(EventFlag *f, uint64_t bits) {
     pthread_mutex_lock(&f->lock);
     f->bits|=bits;
     pthread_cond_broadcast(&f->cond);
@@ -121,6 +151,7 @@ static ABI int32_t ef_wait(EventFlag *handle, uint64_t bits, uint32_t mode, uint
     EventFlag *f=flag(handle);
     if (!f) return ERR(E_SRCH);
     if (!bits || !ef_valid_mode(mode)) return ERR(E_INVAL);
+    runtime_evf_flush_deferred();
     pthread_mutex_lock(&f->lock);
     if (!(f->attr & EF_ATTR_MULTI) && f->waiters) { pthread_mutex_unlock(&f->lock); return ERR(1); }
     struct timespec deadline;
@@ -273,50 +304,8 @@ static ABI int32_t random_number(void *buffer, uint64_t size) {
     }
     return 0;
 }
-/* ---- PlayStation VR headset: the library works, no headset is detected (as shadPS4) ---- */
-#define HMD_NOT_INITIALIZED ((int32_t)0x81110002)
-#define HMD_HANDLE_INVALID ((int32_t)0x81110003)
-#define HMD_ALREADY_OPENED ((int32_t)0x81110006)
-#define HMD_PARAMETER_NULL ((int32_t)0x81110008)
-#define HMD_HANDLE 0xf000000 /* positive, distinct from other VrTracker devices */
-static int hmd_initialized;
-static int32_t hmd_handle, hmd_user=-1;
-static ABI int32_t hmd_initialize(const void *param) {
-    if (!param) return HMD_PARAMETER_NULL;
-    hmd_initialized=1;
-    return 0;
-}
-static ABI int32_t hmd_terminate(void) {
-    if (!hmd_initialized) return HMD_NOT_INITIALIZED;
-    hmd_initialized=0;
-    return 0;
-}
-static ABI int32_t hmd_open(int32_t user, int32_t type, int32_t index, const void *param) {
-    (void)type; (void)index; (void)param;
-    if (!hmd_initialized) return HMD_NOT_INITIALIZED;
-    if (hmd_handle) return HMD_ALREADY_OPENED;
-    hmd_user=user;
-    return hmd_handle=HMD_HANDLE;
-}
-static ABI int32_t hmd_close(int32_t handle) {
-    if (!hmd_initialized) return HMD_NOT_INITIALIZED;
-    if (handle!=hmd_handle) return HMD_HANDLE_INVALID;
-    hmd_handle=0; hmd_user=-1;
-    return 0;
-}
-/* OrbisHmdDeviceInformation (32 bytes): status NOT_DETECTED (2), user id. */
-static ABI int32_t hmd_device_info(uint32_t *info) {
-    if (!info) return HMD_PARAMETER_NULL;
-    if (!hmd_initialized) return HMD_NOT_INITIALIZED;
-    memset(info,0,32);
-    info[0]=2; info[1]=(uint32_t)hmd_user;
-    return 0;
-}
-/* SDK 4.50+ libraries report a missing headset as an invalid handle. */
-static ABI int32_t hmd_by_handle(void) { return HMD_HANDLE_INVALID; }
-static ABI int32_t hmd_garlic_size(void) { return 0x100000; }
-static ABI int32_t hmd_onion_size(void) { return 0x810; }
-static ABI int32_t hmd_buffer_align(void) { return 0x100; }
+/* ---- PlayStation VR headset, tracking and camera: the GPU library (gpu/shadps4/core/libraries/hmd,
+ * vr_tracker, camera) answers them; without a headset of this machine none is detected. ---- */
 /* Setup dialog: finishes at once, as if the player pressed Circle (USER_CANCELED). */
 static ABI int32_t dialog_finished(void) { return 3; }
 static ABI int32_t hmd_dialog_result(int32_t *result) { if (result) *result=1; return 0; }
@@ -331,11 +320,6 @@ static ABI int32_t https_ca_list(int32_t context, CaList *list) {
 }
 
 static ABI int32_t no_entitlement(void) { return (int32_t)0x80D90007; } /* APP_CONTENT DRM_NO_ENTITLEMENT */
-
-/* ---- PlayStation Camera: none attached; nothing can be opened ---- */
-static ABI int32_t camera_attached(int32_t index) { return index ? (int32_t)0x802E0000 : 0; }
-static ABI int32_t camera_not_connected(void) { return (int32_t)0x802E0010; }
-static ABI int32_t camera_not_open(void) { return (int32_t)0x802E0004; }
 
 /* sceKernelUuidCreate: 16 random bytes, version 4. */
 static ABI int32_t uuid_create(unsigned char *uuid) {
@@ -605,22 +589,9 @@ static const RuntimeExport exports[]={
     {"sceAudioOutMasteringInit",ok_noop}, {"sceAudioOutMasteringSetParam",ok_noop},
     {"sceAudioOutMasteringTerm",ok_noop}, {"sceAjmMemoryUnregister",ok_noop},
     {"sceKernelUuidCreate",uuid_create},
-    {"sceHmdInitialize315",hmd_initialize}, {"sceHmdTerminate",hmd_terminate},
-    {"sceHmdOpen",hmd_open}, {"sceHmdClose",hmd_close}, {"sceHmdGetDeviceInformation",hmd_device_info},
-    {"sceHmdGetDeviceInformationByHandle",hmd_by_handle}, {"sceHmdGetFieldOfView",hmd_by_handle},
-    {"sceHmdReprojectionInitialize",ok_noop}, {"sceHmdReprojectionFinalize",ok_noop},
-    {"sceHmdReprojectionStart",ok_noop}, {"sceHmdReprojectionStop",ok_noop},
-    {"sceHmdReprojectionSetDisplayBuffers",ok_noop}, {"sceHmdReprojectionUnsetDisplayBuffers",ok_noop},
-    {"sceHmdReprojectionSetOutputMinColor",ok_noop},
-    {"sceHmdReprojectionQueryGarlicBuffSize",hmd_garlic_size}, {"sceHmdReprojectionQueryOnionBuffSize",hmd_onion_size},
-    {"sceHmdReprojectionQueryGarlicBuffAlign",hmd_buffer_align}, {"sceHmdReprojectionQueryOnionBuffAlign",hmd_buffer_align},
     {"sceHmdSetupDialogInitialize",ok_noop}, {"sceHmdSetupDialogTerminate",ok_noop},
     {"sceHmdSetupDialogOpen",ok_noop}, {"sceHmdSetupDialogClose",ok_noop},
     {"sceHmdSetupDialogUpdateStatus",dialog_finished}, {"sceHmdSetupDialogGetResult",hmd_dialog_result},
-    {"sceCameraIsAttached",camera_attached}, {"sceCameraOpen",camera_not_connected},
-    {"sceCameraClose",camera_not_open}, {"sceCameraStart",camera_not_open}, {"sceCameraStop",camera_not_open},
-    {"sceCameraSetConfig",camera_not_open}, {"sceCameraSetVideoSync",camera_not_open},
-    {"sceCameraGetFrameData",camera_not_open},
     /* PlayGo: every chunk is installed, so its dialog finishes at once. */
     {"scePlayGoDialogInitialize",ok_noop}, {"scePlayGoDialogTerminate",ok_noop},
     {"scePlayGoDialogOpen",ok_noop}, {"scePlayGoDialogClose",ok_noop},

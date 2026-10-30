@@ -34,6 +34,11 @@ class Runtime;
 
 class Rasterizer {
 public:
+    /// gow3: a headset frame (Presenter::PresentHmdFrame): the frame boundary in VR, where the
+    /// title draws no display buffer pass (NoteFrameStart).
+    void NoteHeadsetFrame() {
+        NoteFrameStart();
+    }
     explicit Rasterizer(const Instance& instance, Scheduler& scheduler, Runtime& runtime,
                         AmdGpu::Liverpool* liverpool);
     ~Rasterizer();

@@ -14,6 +14,7 @@
 #include "sdl_window.h"
 #include "video_core/amdgpu/gow3_msaa.h"
 #include "video_core/amdgpu/gow3_msaa_default.h"
+#include "core/vr/openxr_host.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_amd_paths.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
@@ -127,6 +128,23 @@ Instance::Instance(const Frontend::WindowSystemInfo& window_info, s32 physical_d
         std::printf("GPU: selected GPU %d is not in the device list; choosing automatically\n",
                     physical_device_index);
         physical_device_index = -1;
+    }
+
+    // gow3 (AstroQuest): a headset of the machine's own is driven from one graphics card,
+    // and takes pictures from nowhere else.
+    if (const vk::PhysicalDevice headset_device =
+            Core::Vr::OpenXrHost::Instance().PreferredPhysicalDevice(*instance)) {
+        const auto it = std::ranges::find(physical_devices, headset_device);
+        if (it != physical_devices.end()) {
+            const s32 index = static_cast<s32>(std::distance(physical_devices.begin(), it));
+            if (physical_device_index >= 0 && physical_device_index != index) {
+                LOG_WARNING(Render_Vulkan,
+                            "The headset is driven by graphics card {}, which is used instead "
+                            "of the configured {}",
+                            index, physical_device_index);
+            }
+            physical_device_index = index;
+        }
     }
 
     if (physical_device_index < 0) {
@@ -293,7 +311,11 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 64> enabled_extensions;
+    // gow3 (AstroQuest): what the headset's OpenXR runtime wants of a device it is handed
+    // pictures by. (The names have to outlive the making of the device.)
+    const std::vector<std::string> headset_extensions =
+        Core::Vr::OpenXrHost::Instance().VulkanDeviceExtensions();
+    boost::container::static_vector<const char*, 96> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -453,6 +475,12 @@ bool Instance::CreateDevice() {
             feature_chain.get<vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR>();
         // AMD reports no width for graphics executables; its own extension has the ISA.
         amd_shader_info = add_extension(VK_AMD_SHADER_INFO_EXTENSION_NAME);
+    }
+    for (const std::string& name : headset_extensions) {
+        if (std::ranges::none_of(enabled_extensions,
+                                 [&](const char* enabled) { return name == enabled; })) {
+            add_extension(name);
+        }
     }
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;

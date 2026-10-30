@@ -46,7 +46,7 @@ jobs:
             toolchain:p cmake:p ninja:p pkgconf:p python:p
             vulkan-headers:p vulkan-loader:p vulkan-memory-allocator:p glslang:p
             sdl3:p fmt:p boost:p robin-map:p xxhash:p ffmpeg:p zydis:p
-            spirv-tools:p spirv-headers:p spirv-cross:p
+            spirv-tools:p spirv-headers:p spirv-cross:p nlohmann-json:p openxr-sdk:p
       - name: Build
         run: bash build.sh
       # gow3_dlss.dll, the bridge to NVIDIA's DLSS SDK, built with MSVC from the SDK release the

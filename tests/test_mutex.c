@@ -5,6 +5,7 @@
 
 static int32_t guest_errno;
 int32_t *runtime_errno(void) { return &guest_errno; }
+void runtime_evf_flush_deferred(void) {}
 
 static void mark_private(GuestMutex *mutex,int type) {
     /* The x86-64 guest pthread_mutex occupies 0x50 bytes, before host state. */

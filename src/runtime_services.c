@@ -134,12 +134,44 @@ static ABI int32_t system_param(int32_t id,int32_t *value) {
     }
     return 0;
 }
+/* System service events the host raises (the VR runtime: "reset the VR position"), handed to
+ * the title by sceSystemServiceReceiveEvent in order. OrbisSystemServiceEvent: type + 8192. */
+#define SYSTEM_EVENT_SIZE 8196
+#define SYSTEM_EVENTS 8
+static unsigned char system_events[SYSTEM_EVENTS][SYSTEM_EVENT_SIZE];
+static unsigned system_event_first, system_event_count;
+static pthread_mutex_t system_event_lock=PTHREAD_MUTEX_INITIALIZER;
+void runtime_push_system_event(const void *event, size_t size) {
+    pthread_mutex_lock(&system_event_lock);
+    if (system_event_count<SYSTEM_EVENTS) {
+        unsigned char *slot=system_events[(system_event_first+system_event_count)%SYSTEM_EVENTS];
+        memset(slot,0,SYSTEM_EVENT_SIZE);
+        memcpy(slot,event,size<SYSTEM_EVENT_SIZE ? size : SYSTEM_EVENT_SIZE);
+        ++system_event_count;
+    }
+    pthread_mutex_unlock(&system_event_lock);
+}
 static ABI int32_t system_status(unsigned char *status) {
     if (!status) return SYSTEM_PARAMETER;
-    memset(status,0,12); /* event_num=0, no overlay, foreground, normal CPU mode */
+    memset(status,0,12); /* event_num, no overlay, foreground, normal CPU mode */
+    pthread_mutex_lock(&system_event_lock);
+    const int32_t events=(int32_t)system_event_count;
+    pthread_mutex_unlock(&system_event_lock);
+    memcpy(status,&events,4);
     return 0;
 }
-static ABI int32_t system_event(void *event) { (void)event; return SYSTEM_NO_EVENT; }
+static ABI int32_t system_event(void *event) {
+    if (!event) return SYSTEM_PARAMETER;
+    pthread_mutex_lock(&system_event_lock);
+    const int32_t r=system_event_count ? 0 : SYSTEM_NO_EVENT;
+    if (system_event_count) {
+        memcpy(event,system_events[system_event_first],SYSTEM_EVENT_SIZE);
+        system_event_first=(system_event_first+1)%SYSTEM_EVENTS;
+        --system_event_count;
+    }
+    pthread_mutex_unlock(&system_event_lock);
+    return r;
+}
 static ABI int32_t hide_splash(void) { note("SystemService: splash screen hidden"); return 0; }
 static ABI int32_t safe_area(float *info) { if (!info) return SYSTEM_PARAMETER; *info=1.0f; return 0; } /* full screen */
 static ABI int32_t disable_music_player(void) { return 0; }

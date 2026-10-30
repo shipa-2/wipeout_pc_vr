@@ -18,7 +18,11 @@
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_warmup_inbox.h"
+#include "core/vr/openxr_host.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#ifdef MemoryBarrier
+#undef MemoryBarrier // winnt.h's macro (through fmt) clashes with vk::MemoryBarrier
+#endif
 #include "video_core/texture_cache/image.h"
 
 #include <miniz.h>
@@ -319,6 +323,19 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
 
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
+    // gow3 (AstroQuest): a headset of this machine (SteamVR, through OpenXR): its session is
+    // made on this device.
+    vr_exporter = std::make_unique<VrExporter>(instance, draw_scheduler);
+    if (vr_exporter->HasLocalHost()) {
+        Core::Vr::OpenXrHost::Instance().Start({
+            .instance = instance.GetInstance(),
+            .physical_device = instance.GetPhysicalDevice(),
+            .device = instance.GetDevice(),
+            .queue = instance.GetGraphicsQueue(),
+            .queue_family = instance.GetGraphicsQueueFamilyIndex(),
+            .queue_index = 0,
+        });
+    }
     Gow3Overlay::Init(instance, swapchain.GetSurfaceFormat().format, num_images);
 
     const bool binary_cache = EmulatorSettingsImpl::Flag("GOW3_PIPELINE_BINARIES", true) &&
@@ -548,8 +565,141 @@ static void DumpRaw(const Instance& instance, Scheduler& scheduler, vk::CommandB
     });
 }
 
+void Presenter::PresentHmdFrame(const Libraries::VideoOut::HmdFrame& hmd, u32 frame_id) {
+    // A headset frame ends a frame of the title's (it draws no display pass in VR): frame
+    // statistics and GOW3_GPU_PROFILE count by it.
+    rasterizer->NoteHeadsetFrame();
+    if (!vr_exporter || !vr_exporter->HasLocalHost()) {
+        return;
+    }
+    // The title hands the eyes over as textures it rendered as colour targets: the cache holds
+    // their contents.
+    std::array<VideoCore::ImageId, 2> ids;
+    for (u32 eye = 0; eye < 2; ++eye) {
+        VideoCore::TextureCache::ImageDesc desc{hmd.eye_textures[eye], Shader::ImageResource{}};
+        ids[eye] = texture_cache.FindImage(desc);
+        texture_cache.UpdateImage(ids[eye]);
+    }
+    const auto& left = texture_cache.GetImage(ids[0]).info;
+    const u32 eye_width = left.size.width, eye_height = left.size.height;
+    Frame* const target = vr_exporter->AcquireLocal(eye_width * 2, eye_height);
+    if (target == nullptr) {
+        return; // the headset shows nothing now
+    }
+    draw_scheduler.EndRendering();
+    // WipEout hands both eyes over as the two layers of one array texture (each descriptor's
+    // base_array names its layer): each eye is read from its own layer.
+    struct Eye {
+        vk::Image image;
+        vk::Format format;
+        u32 width, height;
+        u32 layer;
+    };
+    std::array<Eye, 2> eyes;
+    for (u32 eye = 0; eye < 2; ++eye) {
+        auto& image = texture_cache.GetImage(ids[eye]);
+        runtime.Transit(&image, vk::ImageLayout::eTransferSrcOptimal,
+                        vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+        eyes[eye] = {image.GetImage(), image.info.pixel_format, image.info.size.width,
+                     image.info.size.height,
+                     std::min<u32>(u32(hmd.eye_textures[eye].base_array),
+                                   image.info.resources.layers - 1)};
+    }
+    runtime.FlushBarriers();
+    // The swapchain is sRGB (OpenXrHost::FrameFormat). Eyes the title keeps sRGB-encoded in an
+    // RGBA8 UNORM image are copied byte for byte (a blit would encode them a second time);
+    // sRGB images and others are blitted, which converts.
+    const auto byte_copy = [&](const Eye& e) {
+        return (e.format == vk::Format::eR8G8B8A8Unorm || e.format == vk::Format::eR8G8B8A8Srgb) &&
+               e.width == target->width / 2 && e.height == target->height;
+    };
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        LOG_INFO(Render_Vulkan, "Headset frames: eyes {}x{} {}, swapchain {}x{} ({})", eye_width,
+                 eye_height, vk::to_string(eyes[0].format), target->width, target->height,
+                 byte_copy(eyes[0]) ? "copied" : "blitted");
+    }
+    const bool copy = byte_copy(eyes[0]) && byte_copy(eyes[1]);
+    const vk::Image dst = target->image;
+    const u32 half = target->width / 2, height = target->height;
+    draw_scheduler.Record([eyes, dst, half, height, copy](vk::CommandBuffer cmdbuf) {
+        const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+        const vk::ImageMemoryBarrier2 to_write{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eTransferDstOptimal,
+            .image = dst,
+            .subresourceRange = range,
+        };
+        cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_write});
+        for (u32 eye = 0; eye < 2; ++eye) {
+            const vk::ImageSubresourceLayers layers{vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+            const vk::ImageSubresourceLayers source{vk::ImageAspectFlagBits::eColor, 0,
+                                                    eyes[eye].layer, 1};
+            if (copy) {
+                const vk::ImageCopy region{
+                    .srcSubresource = source,
+                    .dstSubresource = layers,
+                    .dstOffset = {static_cast<s32>(eye * half), 0, 0},
+                    .extent = {half, height, 1},
+                };
+                cmdbuf.copyImage(eyes[eye].image, vk::ImageLayout::eTransferSrcOptimal, dst,
+                                 vk::ImageLayout::eTransferDstOptimal, region);
+            } else {
+                const vk::ImageBlit region{
+                    .srcSubresource = source,
+                    .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
+                                             vk::Offset3D{static_cast<s32>(eyes[eye].width),
+                                                          static_cast<s32>(eyes[eye].height), 1}},
+                    .dstSubresource = layers,
+                    .dstOffsets = std::array{vk::Offset3D{static_cast<s32>(eye * half), 0, 0},
+                                             vk::Offset3D{static_cast<s32>((eye + 1) * half),
+                                                          static_cast<s32>(height), 1}},
+                };
+                cmdbuf.blitImage(eyes[eye].image, vk::ImageLayout::eTransferSrcOptimal, dst,
+                                 vk::ImageLayout::eTransferDstOptimal, region, vk::Filter::eLinear);
+            }
+        }
+        // OpenXrHost::EndFrame: the image is left in the General layout.
+        const vk::ImageMemoryBarrier2 to_host{
+            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
+            .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+            .newLayout = vk::ImageLayout::eGeneral,
+            .image = dst,
+            .subresourceRange = range,
+        };
+        cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_host});
+    });
+    target->ready_tick = draw_scheduler.CurrentTick();
+    SubmitInfo info{};
+    draw_scheduler.Flush(info);
+    const Core::Vr::PresentedFrame presented{
+        .id = frame_id,
+        .render_pose = hmd.render_pose,
+        .fov = hmd.fov,
+        .eye_width = eye_width,
+        .eye_height = eye_height,
+    };
+    // Handed over once the GPU has done it, without holding up this thread.
+    draw_scheduler.DeferPriorityOperation(
+        [this, target, presented] { vr_exporter->Deliver(target, presented); });
+}
+
+Frame* Presenter::PrepareHmdMirrorFrame(const Libraries::VideoOut::HmdFrame& hmd) {
+    VideoCore::TextureCache::ImageDesc desc{hmd.eye_textures[0], Shader::ImageResource{}};
+    const VideoCore::ImageId id = texture_cache.FindImage(desc);
+    texture_cache.UpdateImage(id);
+    return PrepareFrame({}, 0, id);
+}
+
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
-                               VAddr cpu_address) {
+                               VAddr cpu_address, VideoCore::ImageId source) {
     // gow3: GOW3_FRAME_DUMP_TRIGGER=<file>: when the file exists it is removed and this frame's
     // guest display buffer and presented image are written to GOW3_DUMP_DIR (default out/dump)
     // as raw 32-bit pixels (menus and movies included; the upscaler dumps scene frames only).
@@ -558,9 +708,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     const bool frame_dump = frame_dump_trigger && std::remove(frame_dump_trigger) == 0;
     // gow3: scaled upscaler presets: the output-size display buffer drawn by the port.
     TemporalUpscaler::Display display{};
-    const bool upscaled = rasterizer->GetUpscaler().DisplayOverride(cpu_address, display);
-    VideoCore::ImageId image_id{};
-    if (!upscaled) {
+    const bool upscaled =
+        !source && rasterizer->GetUpscaler().DisplayOverride(cpu_address, display);
+    VideoCore::ImageId image_id = source;
+    if (!upscaled && !source) {
         auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
         image_id = texture_cache.FindImage(desc);
         texture_cache.UpdateImage(image_id);
@@ -595,7 +746,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     });
 
     VideoCore::ImageViewInfo view_info{};
-    view_info.format = GetFrameViewFormat(attribute.attrib.pixel_format);
+    view_info.format = source ? texture_cache.GetImage(source).info.pixel_format
+                              : GetFrameViewFormat(attribute.attrib.pixel_format);
     // Exclude alpha from output frame to avoid blending with UI.
     view_info.mapping.a = vk::ComponentSwizzle::eOne;
 
@@ -669,9 +821,18 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                                  fsr_settings, frame->is_hdr);
 
     // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches
-    // the post process pass still sRGB encoded and has to be decoded there instead.
+    // the post process pass still sRGB encoded and has to be decoded there instead. A plain
+    // A2R10G10B10 buffer is taken as linear and encoded here (shadPS4's reading).
+    // GOW3_DISPLAY_10BIT_ENCODED=1: a plain A2R10G10B10 buffer is shown as it is (as if it held
+    // display-encoded values): a darker, more contrasted picture.
+    static const bool encoded_10bit = [] {
+        const char* env = std::getenv("GOW3_DISPLAY_10BIT_ENCODED");
+        return env && env[0] == '1';
+    }();
+    const auto format = attribute.attrib.pixel_format;
     pp_settings.srgb_input =
-        attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
+        !source && (format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb ||
+                    (encoded_10bit && format == Libraries::VideoOut::PixelFormat::A2R10G10B10));
     // gow3: black bars around a cutscene when the render resolution is not 16:9 (movie_bars.h).
     pp_settings.picture = MovieBars::Cutscenes().Bars(image_size.width, image_size.height,
                                                       MovieBars::NowMs());

@@ -16,7 +16,7 @@ pacman -S --needed git patch \
   mingw-w64-clang-x86_64-{toolchain,cmake,ninja,pkgconf,python} \
   mingw-w64-clang-x86_64-{vulkan-headers,vulkan-loader,vulkan-memory-allocator,glslang} \
   mingw-w64-clang-x86_64-{sdl3,fmt,boost,robin-map,xxhash,ffmpeg,zydis} \
-  mingw-w64-clang-x86_64-{spirv-tools,spirv-headers,spirv-cross}
+  mingw-w64-clang-x86_64-{spirv-tools,spirv-headers,spirv-cross,nlohmann-json,openxr-sdk}
 ```
 
 magic_enum, miniz and xbyak (not packaged by MSYS2) are submodules under `gpu/third_party/`.

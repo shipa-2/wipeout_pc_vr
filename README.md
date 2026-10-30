@@ -44,7 +44,7 @@ Thanks to everyone who has played, tested and reported so far!
 |---|---|
 | Unpack the game and its update | Done (`scripts/pkg_extract.py`) |
 | Load and link the executable (eboot.bin, libc, Fios2, NpToolkit2) | Done |
-| PS4 system functions the game uses | Done for menus and races; PSN, VR and camera answer as an offline console |
+| PS4 system functions the game uses | Done for menus and races; PSN answers as an offline console; PS VR and camera as a console without them, unless VR is turned on |
 | Boot, menus, saves | Done |
 | Races (HD and 2048), race results | Done |
 | Game speed | Done: the game runs on real time at any frame rate |
@@ -58,7 +58,7 @@ Thanks to everyone who has played, tested and reported so far!
 | Windows package (zip) | Done (`packaging/windows/package.sh`, Actions > Windows zip) |
 | Linux | Builds from source; no package yet |
 | PS4 Pro mode | Experimental (`GOW3_NEO=1`): loads a race with a correct picture since v0.2.3 (#32, #33); not tested further |
-| PSVR mode | Not planned for now (#7) |
+| PSVR mode | Experimental: in a PC headset through OpenXR (SteamVR), off unless turned on ([docs/VR.md](docs/VR.md), #7) |
 | Every game and event type (HD, HD Fury, 2048) | Not all tested yet |
 
 2048 races need red-zone protection on Windows (`src/redzone.cpp`): the game's profile turns
