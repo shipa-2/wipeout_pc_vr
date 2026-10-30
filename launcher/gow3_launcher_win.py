@@ -435,7 +435,7 @@ UI_SCALES = [('auto', ('Auto',)), ('1', ('1x',)), ('2', ('2x',))]
 PAD_SCHEMES = [('', ("Standard (the game's)",)), ('racer', ('Racer: R2 accelerate, L2 brake',))]
 GAMEPAD_NUMBERS = [('1', ('First connected',)), ('2', ('Second connected',)), ('3', ('Third connected',)),
                    ('4', ('Fourth connected',))]
-APP_DEFAULTS = {'ui_language': 'en', 'ui_scale': 'auto', 'game_dir': os.environ.get('GOW3_GAME_DIR', str(PORT_DIR.parent / 'CUSA07671') if WINDOWS else ''), 'update_dir': '', 'experimental_upscaler': False, 'ps4_pro': False, 'cheat_events': False, 'cheat_rank': False, 'cheat_ships': False, 'cheat_van_uber': False, 'cheat_vr_ships': False,
+APP_DEFAULTS = {'ui_language': 'en', 'ui_scale': 'auto', 'game_dir': os.environ.get('GOW3_GAME_DIR', str(PORT_DIR.parent / 'CUSA07671') if WINDOWS else ''), 'update_dir': '', 'experimental_upscaler': False, 'ps4_pro': False, 'vr': False, 'vr_eye_scale': '2', 'vr_vrs': False, 'cheat_events': False, 'cheat_rank': False, 'cheat_ships': False, 'cheat_van_uber': False, 'cheat_vr_ships': False,
                 'video_backend': 'auto', 'gamemode': False, 'mangohud': False, 'desktop_integration': True, 'user_dir': '', 'savedata_dir': '',
                 'music_dir': '', 'mods_dir': '', 'mods_enabled': True, 'patches_dir': '', 'language': '1',
                 'hdr': False, 'draw_pipe': '', 'readbacks': '', 'no_msaa': '', 'stream_memory': 'cached', 'texture_limit': '',
@@ -725,6 +725,29 @@ FRAMES_QUEUED = [('1', ('1 (lowest latency)',)), ('2', ('2',)), ('0', ('Unlimite
 # GOW3_TEXTURE_LIMIT (texture_cache.h LimitTextureSize): the largest textures load at most this big.
 TEXTURE_LIMITS = [('', ('Full (default)',)), ('4096', ('Medium (largest textures at 4096)',)),
                   ('2048', ('Low (for 4 GB graphics cards)',))]
+# VR (PlayStation VR in a PC headset through OpenXR, docs/VR.md): the patches of the game's patch
+# file it plays with, and the eye resolutions (the game's own scale is 1.4).
+VR_PATCHES = ('VR - 120 FPS', 'VR - No dynamic resolution', 'VR - Game memory 5248 MiB', 'VR - Eye resolution')
+VR_PATCH_PREFIX = 'VR - '  # the launcher's VR section chooses these; the Patches page leaves them out
+VR_EYE_SCALE_RANGE = (1.0, 3.0, 0.05)
+
+
+def vr_eye_size(scale, panel_width=1920):
+    """The eye size WipEout renders at for a scale: panel width / 2 x panel height (1080) times
+    it, the width at most 4096 (gpu/shadps4/core/libraries/hmd/hmd.cpp). panel_width: the panel the
+    game was told of with the last headset (vr_panel.json), a PS VR's 1920 before one was seen."""
+    if panel_width / 2 * scale > 4096:
+        panel_width = max(960, int(4096 / scale)) // 8 * 8 * 2
+    return int(panel_width / 2 * scale + 0.5), int(1080 * scale + 0.5)
+
+
+def vr_panel_width(user_dir):
+    """The panel width the game reported to WipEout for the last headset, or None."""
+    try:
+        width = int(json.loads((Path(user_dir) / 'vr_panel.json').read_text())['panel_width'])
+        return width if 960 <= width <= 8192 else None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
 # The Cheats page: (setting, patch in the game's patch file, title, hint).
 CHEATS = (('cheat_events', 'Cheat - Unlock all HD and Fury events', 'Unlock all HD and HD Fury events',
            ('Every event of the HD and HD Fury campaigns is open; the campaign screen shows 99998 points. '
@@ -1208,6 +1231,19 @@ def game_environment(s):
     # The Cheats page: its patches join the selection (patches/WipEout_Omega_Collection.xml).
     if cheats := [patch for key, patch, _t, _h in CHEATS if s.get(key)]:
         env['GOW3_PATCHES'] = ';'.join([n for n in env.get('GOW3_PATCHES', '').split(';') if n] + cheats)
+    # VR: the game sees a PlayStation VR and plays in the headset of this machine (SteamVR or
+    # another OpenXR runtime), with its patches (VR_PATCHES) and the chosen eye resolution.
+    env.pop('SHADPS4_VR', None)
+    if s.get('vr'):
+        env['SHADPS4_VR'] = '1'
+        env['GOW3_VR_VRS'] = '1' if s.get('vr_vrs') else '0'
+        env['GOW3_VR_EYE_SCALE'] = f"{float(s.get('vr_eye_scale') or 2):g}"
+    # The VR patches go with the VR switch only (a selection saved before may still name them).
+    chosen = [n for n in env.get('GOW3_PATCHES', '').split(';') if n and not n.startswith(VR_PATCH_PREFIX)]
+    if s.get('vr'):
+        chosen += VR_PATCHES
+    if chosen or env.get('GOW3_PATCHES'):
+        env['GOW3_PATCHES'] = ';'.join(chosen)
     if s['user_dir']:
         env['GOW3_USER_DIR'] = s['user_dir']
     env.pop('GOW3_SAVEDATA_DIR', None)
@@ -1664,6 +1700,28 @@ class Launcher:
         show()
         return holder
 
+    def vr_eye_slider(self, parent):
+        """The VR eye scale (launcher setting vr_eye_scale) on a slider, the eye resolution beside it."""
+        low, high, step = VR_EYE_SCALE_RANGE
+        holder = self.ttk.Frame(parent)
+        scale = self.var('vr_eye_scale', 'app')
+        amount = self.tk.DoubleVar(value=float(scale.get() or 2))
+        self.tk.Scale(holder, from_=low, to=high, resolution=step, orient='horizontal', variable=amount,
+                      showvalue=False, length=self.px(260), width=self.px(12), sliderlength=self.px(18), bg=ACCENT,
+                      troughcolor=CARD, activebackground=ACCENT_HI, highlightthickness=0, bd=0,
+                      sliderrelief='flat').pack(side='left')
+        value = self.ttk.Label(holder, width=18)
+        value.pack(side='left', padx=self.px(10))
+
+        def show(*_a):
+            factor = round(amount.get() / step) * step
+            scale.set(f'{factor:g}')
+            width, height = vr_eye_size(factor, vr_panel_width(self.user_dir()) or 1920)
+            value.configure(text=f'{width} × {height}  ({factor:.2f}x)')
+        amount.trace_add('write', show)
+        show()
+        return holder
+
     def section(self, parent, title, top=20):
         """A section heading with a line under it."""
         r = self.next_row(parent)
@@ -1884,6 +1942,18 @@ class Launcher:
         self.check(f, 'ps4_pro', 'app', _('PS4 Pro mode (experimental)'),
                    _('The game runs as on a PS4 Pro, with its Pro graphics. Menus and a race start work; other events '
                      'are not tested yet. Turn it off if something looks wrong.'), restart=True)
+        self.section(f, _('VR (experimental)'))
+        self.check(f, 'vr', 'app', _('Play in a VR headset'),
+                   _('The game runs in its PlayStation VR mode in the headset of this PC, through SteamVR or another '
+                     'OpenXR runtime (start it first). At 120 FPS with the eye resolution below; the window shows '
+                     'the left eye. Off: the game as on a PS4 without PlayStation VR.'), restart=True)
+        self.row(f, _('Eye resolution'), self.vr_eye_slider(f),
+                 _('The size each eye is drawn at, for the headset the game saw last (a PlayStation VR\'s shape '
+                   'before that). Higher is sharper and needs a faster graphics card to hold 120 FPS.'),
+                 restart=True)
+        self.check(f, 'vr_vrs', 'app', _('Foveated rendering'),
+                   _('The edges of each eye, which the lenses blur, are shaded at a lower rate: more FPS at the '
+                     'same resolution. Needs a graphics card with variable rate shading.'), restart=True)
         self.section(f, _('Anti-aliasing (experimental)'))
         self.check(f, 'experimental_upscaler', 'app', _('Temporal anti-aliasing'),
                    _('Off (default): the game\'s own image. On: FSR 3.1 or DLAA smooth edges at the render '
@@ -2188,7 +2258,7 @@ class Launcher:
                        '{} · версия {} · {}.').format(title_id, version, xml.name), top=0)
         for meta in metas:
             name = meta.get('Name')
-            if name.startswith((EXCLUSIVE_PREFIX, 'Frame Rate Patch', 'Cheat - ')) or name in ALWAYS_ON:
+            if name.startswith((EXCLUSIVE_PREFIX, 'Frame Rate Patch', 'Cheat - ', VR_PATCH_PREFIX)) or name in ALWAYS_ON:
                 continue
             var = tk.BooleanVar(value=name in on)
             self.game_patch_vars[name] = var

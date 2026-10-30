@@ -8,6 +8,7 @@
 #include <cmath>
 #include "common/elf_info.h"
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/hmd/hmd.h"
 #include "core/libraries/hmd/hmd_error.h"
@@ -50,6 +51,19 @@ static u32 ReportedPanelWidth() {
         return PanelWidth;
     }
     u32 width = 2 * static_cast<u32>(std::lround(PanelHeight * aspect / 8.0f) * 8);
+    // gow3: the launcher shows the eye resolution its VR slider gives on this headset
+    // (vr_panel.json in the user folder: the panel width before the 4096 limit below).
+    static u32 recorded = 0;
+    if (recorded != width) {
+        recorded = width;
+        const auto path =
+            Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "vr_panel.json";
+        if (FILE* file = std::fopen(path.string().c_str(), "w")) {
+            std::fprintf(file, "{\"panel_width\": %u, \"panel_height\": %u}\n", width,
+                         PanelHeight);
+            std::fclose(file);
+        }
+    }
     // WipEout's eye width is panel width / 2 x its scale (the table at 0x86ed00 that the
     // vr_scale patch writes). Over 4096 the game pads the eye's pitch to 8192 (512 MiB targets
     // the texture cache cannot reconcile): the eyes stay at most 4096 wide.

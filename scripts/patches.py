@@ -100,11 +100,16 @@ def resolve_targets(image, meta, sites):
 
 def fill(value, at, targets):
     """Value bytes with each {rel:NAME:TAIL} replaced by the rel32 to target NAME, measured from the
-    end of the instruction (TAIL bytes after the operand)."""
+    end of the instruction (TAIL bytes after the operand), and each {f32:VARIABLE:DEFAULT} by the
+    float32 the environment variable holds (a launcher setting, such as the VR eye scale)."""
     out=bytearray()
     for part in re.split(r'(\{[^}]*\})',value.replace(' ','')):
         if not part.startswith('{'):
             out+=bytes.fromhex(part)
+            continue
+        if part.startswith('{f32:'):
+            _,variable,default=part[1:-1].split(':')
+            out+=struct.pack('<f',float(os.environ.get(variable) or default))
             continue
         _,name,tail=part[1:-1].split(':')
         out+=struct.pack('<i',targets[name]-(at+len(out)+4+int(tail)))

@@ -715,4 +715,40 @@
             <Line Type="bytes" Address="0x009aa1e7" Value="eb" Pattern="41 80 bd 4d 07 00 00 00 0f 94 c0 0a 85 ?? ?? ?? ?? a8 01 75 1d 4a 63 84 bb b0 01 00 00 4a 8d 0c 33 8a 94 08 a0 16 00 00 80 f2 01 88 94 08 00 19 00 00" At="19"/>
         </PatchList>
     </Metadata>
+    <!-- PlayStation VR (VR mode of the port: SHADPS4_VR=1 or the launcher's VR switch, docs/VR.md).
+         Found on the eboot.bin with sha256 3a52e910f6c450cc2f0c85ef994be5d8c951c326a362bcc4775f29e6ff7f644c.
+         - Eye resolution: the VR layer sizes the eye render targets from the headset's panel
+           (sceHmdGetDeviceInformation): width = panel width / 2 * scale + 0.5, height = panel height * scale
+           + 0.5 (0x7fa681). The scale is a table of two floats at 0x86ed00 (1.4 PS4, 1.5 PS4 Pro, picked at
+           0x7f80e9).
+         - Dynamic resolution: each frame the game picks one of 16 viewports of those targets (0x64b2f6),
+           from a frame time it measures; the branch at 0x64b3c1 falling through keeps level 0, the full size.
+         - Frame rate: the tracker control thread (VRTrackerCntrTh) lets the render thread go on after a number
+           of headset flips (the reprojection flips at 120 Hz) read from the tracker settings at 0x658e14 (2:
+           60 FPS); a constant 1 instead gives 120 FPS.
+         - Memory: the game carves its GPU memory (Garlic) out of one direct memory allocation sized from a
+           table at 0x86bb60 (4224 MiB PS4, 4736 MiB PS4 Pro). Larger eyes ran it out on heavier tracks (its
+           allocator returned NULL and the game crashed clearing the buffer, 0x742694). -->
+    <Metadata Title="WipEout Omega Collection" Name="VR - 120 FPS" Note="In VR the game draws a frame every headset refresh (120 Hz) instead of every second one with reprojection in between (60 FPS)." Author="shipa-2" PatchVer="1.0" AppVer="01.00" AppElf="eboot.bin" isEnabled="false">
+        <PatchList>
+            <!-- mov r14b, 1 in place of the 7-byte load of the flip interval -->
+            <Line Type="bytes" Address="0x00a58e14" Value="41b6010f1f4000" Pattern="e8 ?? ?? ?? ?? 8a 1d ?? ?? ?? ?? 44 8a 35 ?? ?? ?? ??" At="11"/>
+        </PatchList>
+    </Metadata>
+    <Metadata Title="WipEout Omega Collection" Name="VR - No dynamic resolution" Note="In VR the eyes always render at their full size: the game no longer lowers it when a frame takes long (the picture pulsed in and out of focus)." Author="shipa-2" PatchVer="1.0" AppVer="01.00" AppElf="eboot.bin" isEnabled="false">
+        <PatchList>
+            <Line Type="bytes" Address="0x00a4b3c1" Value="9090" Pattern="8b 05 ?? ?? ?? ?? 83 fb 0f 72 02 b3 0f 83 f8 01 7f 02 31 db" At="16"/>
+        </PatchList>
+    </Metadata>
+    <Metadata Title="WipEout Omega Collection" Name="VR - Eye resolution" Note="In VR (PlayStation VR in a PC headset): the eyes render at GOW3_VR_EYE_SCALE (the launcher's eye resolution slider, 2 when unset) times the PS VR panel size instead of 1.4 (a PS4's; 1.5 on a PS4 Pro). Larger eyes want the VR game memory patch." Author="shipa-2" PatchVer="1.0" AppVer="01.00" AppElf="eboot.bin" isEnabled="false">
+        <PatchList>
+            <!-- scale of both models (PS4, PS4 Pro) in the table the VR layer sizes its eye targets from -->
+            <Line Type="bytes" Address="0x00c6ed00" Value="{f32:GOW3_VR_EYE_SCALE:2}{f32:GOW3_VR_EYE_SCALE:2}" Pattern="00 00 80 3f 33 33 b3 3f 00 00 c0 3f 9f 32 a0 ff" At="4"/>
+        </PatchList>
+    </Metadata>
+    <Metadata Title="WipEout Omega Collection" Name="VR - Game memory 5248 MiB" Note="The game's GPU memory pool is 5248 MiB instead of a PS4's 4224 MiB: larger VR eyes ran it out on heavier tracks and the game crashed. Requires setting DMEM to 1088 MB." Author="shipa-2" PatchVer="1.0" AppVer="01.00" AppElf="eboot.bin" isEnabled="false">
+        <PatchList>
+            <Line Type="bytes" Address="0x00c6bb60" Value="0000004801000000" Pattern="00 00 00 00 00 00 00 00 00 00 00 08 01 00 00 00 00 00 00 10 00 00 00 00" At="8"/>
+        </PatchList>
+    </Metadata>
 </Patch>

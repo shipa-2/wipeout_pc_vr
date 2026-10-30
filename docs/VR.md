@@ -12,13 +12,30 @@ VR is off unless it is turned on: the game sees no headset and plays as before.
 ## Starting
 
 1. Start SteamVR (or another OpenXR runtime) with the headset connected.
-2. Start the game with `SHADPS4_VR=1` in the environment of `run.py`. The game then draws
-   60 frames a second, which the headset shows twice each, with its own dynamic resolution.
+2. Launcher: Graphics > VR > *Play in a VR headset*, then PLAY. Or `SHADPS4_VR=1` in the
+   environment of `run.py`, with the VR patches below in `GOW3_PATCHES` (without them the game
+   draws 60 frames a second, which the headset shows twice each, with its own dynamic
+   resolution).
 
 The vblank runs at 480 Hz in VR (`run.py`, when `GOW3_VBLANK_HZ` is not set): the headset's
 refreshes for the game are taken at its ticks, and at 60 Hz the game got at most 60 a second.
 The window shows the left eye. Do not kill the game process (`kill -9`, stopping it in a debugger)
 while SteamVR shows it: SteamVR may crash with it.
+
+## Patches
+
+The launcher's VR switch enables these (`patches/WipEout_Omega_Collection.xml`):
+
+| Patch | What it does |
+|---|---|
+| VR - 120 FPS | A frame every headset refresh instead of every second one |
+| VR - No dynamic resolution | The eyes always at full size (the game's own scaling pulsed the picture) |
+| VR - Game memory 5248 MiB | A larger GPU memory pool for the game: larger eyes ran out of it on heavier tracks |
+| VR - Eye resolution | The eye size: `GOW3_VR_EYE_SCALE` (2 when unset) times the PS VR panel (the game's own is 1.4) |
+
+They are not on the Patches page: the VR switch turns them on. The launcher's eye resolution
+slider sets `GOW3_VR_EYE_SCALE` (1 to 3) and shows the eye size it gives on the headset the game
+saw last (`vr_panel.json` in the user folder); *Foveated rendering* is `GOW3_VR_VRS=1`.
 
 ## Environment
 
