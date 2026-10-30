@@ -15,6 +15,8 @@ VR is off unless it is turned on: the game sees no headset and plays as before.
 2. Start the game with `SHADPS4_VR=1` in the environment of `run.py`. The game then draws
    60 frames a second, which the headset shows twice each, with its own dynamic resolution.
 
+The vblank runs at 480 Hz in VR (`run.py`, when `GOW3_VBLANK_HZ` is not set): the headset's
+refreshes for the game are taken at its ticks, and at 60 Hz the game got at most 60 a second.
 The window shows the left eye. Do not kill the game process (`kill -9`, stopping it in a debugger)
 while SteamVR shows it: SteamVR may crash with it.
 

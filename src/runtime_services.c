@@ -537,17 +537,24 @@ static ABI int32_t trophy_unlock_state(int32_t ctx,int32_t handle,uint32_t *flag
 static ABI int32_t trophy_release(int32_t id) { return id>0 ? 0 : TROPHY_INVALID; }
 
 /* ---- PlayGo: fully installed package ---- */
-static int playgo_handle, playgo_chunks=-1;
+/* playgo_known: the package's sce_sys/playgo-chunk.dat says how many chunks there are. Dumps
+ * often lack it (it is a package entry, not a file of the game's filesystem): then any chunk the
+ * game names is installed. Answering "no such chunk" made WipEout take some tracks for
+ * still downloading: it opened the PlayGo dialog, which ends "cancelled", and never started them. */
+static int playgo_handle, playgo_chunks=-1, playgo_known;
 static ABI int32_t playgo_init(const void *params) {
     (void)params;
     int fd=(int)runtime_file_open("/app0/sce_sys/playgo-chunk.dat",0,0);
     unsigned char header[12];
-    playgo_chunks=1;
+    playgo_chunks=1; playgo_known=0;
     if (fd>=0) {
-        if (runtime_file_read(fd,header,sizeof(header))==sizeof(header)) playgo_chunks=header[10]|header[11]<<8;
+        if (runtime_file_read(fd,header,sizeof(header))==sizeof(header)) {
+            playgo_chunks=header[10]|header[11]<<8; playgo_known=1;
+        }
         runtime_file_close(fd);
     }
-    printf("Runtime: PlayGo initialized; %d chunks, all installed locally\n",playgo_chunks);
+    if (playgo_known) printf("Runtime: PlayGo initialized; %d chunks, all installed locally\n",playgo_chunks);
+    else printf("Runtime: PlayGo initialized; no playgo-chunk.dat, every chunk installed locally\n");
     return 0;
 }
 static ABI int32_t playgo_open(int32_t *handle,const void *param) {
@@ -569,7 +576,7 @@ static ABI int32_t playgo_locus(int32_t handle,const uint16_t *ids,uint32_t coun
     if (!ids || !loci) return PLAYGO_BAD_POINTER;
     if (!count) return PLAYGO_BAD_SIZE;
     for (uint32_t i=0;i<count;++i) {
-        if (ids[i]>=playgo_chunks) return PLAYGO_BAD_CHUNK;
+        if (playgo_known && ids[i]>=playgo_chunks) return PLAYGO_BAD_CHUNK;
         loci[i]=3; /* LocalFast */
     }
     return 0;

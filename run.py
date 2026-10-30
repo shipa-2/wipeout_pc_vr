@@ -322,7 +322,9 @@ def main():
                     env[key] = str(value)
                     derived.append(key)
         if 'GOW3_VBLANK_HZ' not in env:
-            env['GOW3_VBLANK_HZ'] = '60'
+            # VR (docs/VR.md): the headset's refreshes for the game (120 Hz) are taken at vblank
+            # ticks; at 60 the game got at most 60 a second (~50 FPS in the headset).
+            env['GOW3_VBLANK_HZ'] = '480' if env.get('SHADPS4_VR') == '1' else '60'
             derived.append('GOW3_VBLANK_HZ')
         # Without the frame rate patch the engine steps 1/60 s per frame: the present thread must
         # not flip faster (gow3_graphics.h PresentLimit), or the game speeds up. A game whose
