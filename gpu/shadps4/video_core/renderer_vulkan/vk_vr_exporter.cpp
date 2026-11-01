@@ -44,9 +44,9 @@ bool VrExporter::IsLocal(const Frame* frame) const {
                                [&](const auto& local) { return local.get() == frame; });
 }
 
-void VrExporter::Deliver(Frame* frame, const Core::Vr::PresentedFrame& info) {
+void VrExporter::Deliver(Frame* frame, u64 ready_tick, const Core::Vr::PresentedFrame& info) {
     // The host copies the image as soon as it hears about the frame.
-    scheduler.Wait(frame->ready_tick);
+    scheduler.Wait(ready_tick);
     Core::Vr::OpenXrHost::Instance().EndFrame(static_cast<u32>(frame->host_buffer), info);
 }
 

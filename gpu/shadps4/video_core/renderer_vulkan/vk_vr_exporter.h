@@ -33,7 +33,7 @@ public:
     bool IsLocal(const Frame* frame) const;
 
     /// Tells the host the frame is ready. Blocks until the GPU is done with it.
-    void Deliver(Frame* frame, const Core::Vr::PresentedFrame& info);
+    void Deliver(Frame* frame, u64 ready_tick, const Core::Vr::PresentedFrame& info);
     /// The frame will not be finished after all.
     void Drop(Frame* frame);
 

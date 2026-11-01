@@ -686,9 +686,14 @@ void Presenter::PresentHmdFrame(const Libraries::VideoOut::HmdFrame& hmd, u32 fr
         .eye_width = eye_width,
         .eye_height = eye_height,
     };
-    // Handed over once the GPU has done it, without holding up this thread.
-    draw_scheduler.DeferPriorityOperation(
-        [this, target, presented] { vr_exporter->Deliver(target, presented); });
+    // Handed over once the GPU has done it, without holding up this thread. The tick is taken
+    // now: the frame object is the swapchain image's and is reused by a later headset frame,
+    // whose tick (not submitted yet) made the operation submit from its own thread, at the
+    // same time as this one (a corrupted command queue, a crash at ~100 FPS).
+    const u64 ready_tick = target->ready_tick;
+    draw_scheduler.DeferPriorityOperation([this, target, ready_tick, presented] {
+        vr_exporter->Deliver(target, ready_tick, presented);
+    });
 }
 
 Frame* Presenter::PrepareHmdMirrorFrame(const Libraries::VideoOut::HmdFrame& hmd) {
